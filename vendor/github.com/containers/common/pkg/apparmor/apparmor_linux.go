@@ -1,3 +1,4 @@
+//go:build linux && apparmor
 // +build linux,apparmor
 
 package apparmor
@@ -202,11 +203,6 @@ func parseAAParserVersion(output string) (int, error) {
 	words := strings.Split(lines[0], " ")
 	version := words[len(words)-1]
 
-	// trim "-beta1" suffix from version="3.0.0-beta1" if exists
-	version = strings.SplitN(version, "-", 2)[0]
-	// also trim "~..." suffix used historically (https://gitlab.com/apparmor/apparmor/-/commit/bca67d3d27d219d11ce8c9cc70612bd637f88c10)
-	version = strings.SplitN(version, "~", 2)[0]
-
 	// split by major minor version
 	v := strings.Split(version, ".")
 	if len(v) == 0 || len(v) > 3 {
@@ -237,7 +233,6 @@ func parseAAParserVersion(output string) (int, error) {
 	// major*10^5 + minor*10^3 + patch*10^0
 	numericVersion := majorVersion*1e5 + minorVersion*1e3 + patchLevel
 	return numericVersion, nil
-
 }
 
 // CheckProfileAndLoadDefault checks if the specified profile is loaded and

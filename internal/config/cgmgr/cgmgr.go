@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/containers/podman/v3/pkg/rootless"
 	"github.com/cri-o/cri-o/internal/config/node"
 	libctr "github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/cgroups/fs"
@@ -196,9 +195,9 @@ func libctrCgroupManager(sbParent, containerCgroup string) (libctr.Manager, erro
 		},
 	}
 	if node.CgroupIsV2() {
-		return fs2.NewManager(cg, "", rootless.IsRootless())
+		return fs2.NewManager(cg, "")
 	}
-	return fs.NewManager(cg, nil, rootless.IsRootless()), nil
+	return fs.NewManager(cg, map[string]string{}), nil
 }
 
 func containerCgroupPath(id string) string {
