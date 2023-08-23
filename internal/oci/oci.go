@@ -8,10 +8,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cri-o/cri-o/pkg/config"
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/net/context"
 	"k8s.io/client-go/tools/remotecommand"
+
+	"github.com/cri-o/cri-o/pkg/config"
 )
 
 const (
@@ -216,7 +217,7 @@ func (r *Runtime) newRuntimeImpl(c *Container) (RuntimeImpl, error) {
 	}
 
 	if rh.RuntimeType == config.RuntimeTypeVM {
-		return newRuntimeVM(rh.RuntimePath), nil
+		return newRuntimeVM(rh.RuntimePath, r.config.RuntimeConfig.ContainerExitsDir), nil
 	}
 
 	// If the runtime type is different from "vm", then let's fallback

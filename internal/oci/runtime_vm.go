@@ -41,9 +41,10 @@ const fifoGlobalDir = "/tmp/crio/fifo"
 type runtimeVM struct {
 	path string
 
-	ctx    context.Context
-	client *ttrpc.Client
-	task   task.TaskService
+	exitsPath string
+	ctx       context.Context
+	client    *ttrpc.Client
+	task      task.TaskService
 
 	sync.Mutex
 	ctrs map[string]containerInfo
@@ -54,7 +55,7 @@ type containerInfo struct {
 }
 
 // newRuntimeVM creates a new runtimeVM instance
-func newRuntimeVM(path string) RuntimeImpl {
+func newRuntimeVM(path string, exitsPath string) RuntimeImpl {
 	logrus.Debug("oci.newRuntimeVM() start")
 	defer logrus.Debug("oci.newRuntimeVM() end")
 
@@ -71,9 +72,10 @@ func newRuntimeVM(path string) RuntimeImpl {
 	typeurl.Register(&rspec.WindowsResources{}, prefix, "opencontainers/runtime-spec", major, "WindowsResources")
 
 	return &runtimeVM{
-		path: path,
-		ctx:  context.Background(),
-		ctrs: make(map[string]containerInfo),
+		path:      path,
+		exitsPath: exitsPath,
+		ctx:       context.Background(),
+		ctrs:      make(map[string]containerInfo),
 	}
 }
 
@@ -274,9 +276,21 @@ func (r *runtimeVM) StartContainer(c *Container) error {
 	go func() {
 		_, err = r.wait(r.ctx, c.ID(), "")
 		if err == nil {
+			// create a file on the exitsDir so that cri-o server can detect it
+			path := filepath.Join(r.exitsPath+"/", c.ID())
+			if fileErr := os.WriteFile(path, []byte("Exited"), 0o644); err != nil {
+				logrus.Warningf("Unable to write exit file %v", fileErr)
+			}
 			if err1 := r.updateContainerStatus(c); err1 != nil {
 				logrus.Warningf("error updating container status %v", err1)
 			}
+		} else {
+			// create a file on the exitsDir so that cri-o server can detect it
+			path := filepath.Join(r.exitsPath+"/", c.ID())
+			if fileErr := os.WriteFile(path, []byte("Exited"), 0o644); err != nil {
+				logrus.Warningf("Unable to write exit file2 %v", fileErr)
+			}
+			logrus.Errorf("error wait container terminate %v", err)
 		}
 	}()
 
@@ -637,7 +651,11 @@ func (r *runtimeVM) updateContainerStatus(c *Container) error {
 		if !errors.Is(err, ttrpc.ErrClosed) {
 			return errdefs.FromGRPC(err)
 		}
-		return errdefs.ErrNotFound
+		c.state.Status = ContainerStateStopped
+		exitCode := int32(255)
+		c.state.ExitCode = &exitCode
+		c.state.Finished = time.Now()
+		return nil
 	}
 
 	status := c.state.Status
