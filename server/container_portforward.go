@@ -6,7 +6,6 @@ import (
 	"io/ioutil"
 
 	"github.com/containers/storage/pkg/pools"
-	"github.com/cri-o/cri-o/internal/oci"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
@@ -46,12 +45,7 @@ func (s StreamService) PortForward(podSandboxID string, port int32, stream io.Re
 		return fmt.Errorf("could not find container for sandbox %q", podSandboxID)
 	}
 
-	if err := s.runtimeServer.Runtime().UpdateContainerStatus(c); err != nil {
-		return err
-	}
-
-	cState := c.State()
-	if !(cState.Status == oci.ContainerStateRunning || cState.Status == oci.ContainerStateCreated) {
+	if err := c.IsAlive(); err != nil {
 		return fmt.Errorf("container is not created or running")
 	}
 
