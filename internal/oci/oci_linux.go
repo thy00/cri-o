@@ -136,6 +136,7 @@ func (r *runtimeOCI) containerStats(ctr *Container, sandboxParent string) (stats
 	pid, _ := ctr.pid() // nolint:errcheck
 	if pid > 0 {
 		netNsPath := fmt.Sprintf("/proc/%d/ns/net", pid)
+		stats.NetInput, stats.NetOutput = getContainerNetIO(netNsPath)
 	}
 
 	totalInactiveFile, err := getTotalInactiveFile()
