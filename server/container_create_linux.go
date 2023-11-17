@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package server
@@ -20,14 +21,6 @@ import (
 	selinux "github.com/containers/libpod/pkg/selinux"
 	createconfig "github.com/containers/libpod/pkg/spec"
 	"github.com/containers/storage/pkg/mount"
-	"github.com/cri-o/cri-o/internal/config/node"
-	"github.com/cri-o/cri-o/internal/lib"
-	"github.com/cri-o/cri-o/internal/lib/sandbox"
-	"github.com/cri-o/cri-o/internal/log"
-	oci "github.com/cri-o/cri-o/internal/oci"
-	"github.com/cri-o/cri-o/internal/storage"
-	libconfig "github.com/cri-o/cri-o/pkg/config"
-	"github.com/cri-o/cri-o/utils"
 	securejoin "github.com/cyphar/filepath-securejoin"
 	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/devices"
@@ -37,6 +30,15 @@ import (
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+
+	"github.com/cri-o/cri-o/internal/config/node"
+	"github.com/cri-o/cri-o/internal/lib"
+	"github.com/cri-o/cri-o/internal/lib/sandbox"
+	"github.com/cri-o/cri-o/internal/log"
+	"github.com/cri-o/cri-o/internal/oci"
+	"github.com/cri-o/cri-o/internal/storage"
+	libconfig "github.com/cri-o/cri-o/pkg/config"
+	"github.com/cri-o/cri-o/utils"
 )
 
 // minMemoryLimit is the minimum memory that must be set for a container.
@@ -654,14 +656,11 @@ func (s *Server) createSandboxContainer(ctx context.Context, containerID, contai
 			return nil, err
 		}
 	} else if containerConfig.GetLinux().GetSecurityContext().GetNamespaceOptions().GetPid() == pb.NamespaceMode_POD {
-		infra := sb.InfraContainer()
-		if infra == nil {
-			return nil, errors.New("PID namespace requested, but sandbox has no infra container")
+		pidNsPath := sb.PidNsPath()
+		if pidNsPath == "" {
+			return nil, errors.New("PID namespace requested, but sandbox infra container invalid")
 		}
 
-		// share Pod PID namespace
-		// SEE NOTE ABOVE
-		pidNsPath := fmt.Sprintf("/proc/%d/ns/pid", infra.State().Pid)
 		if err := specgen.AddOrReplaceLinuxNamespace(string(rspec.PIDNamespace), pidNsPath); err != nil {
 			return nil, err
 		}
