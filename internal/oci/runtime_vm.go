@@ -3,6 +3,7 @@ package oci
 import (
 	"bytes"
 	"io"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,13 +18,6 @@ import (
 	"github.com/containerd/containerd/runtime/v2/task"
 	"github.com/containerd/ttrpc"
 	"github.com/containers/libpod/pkg/cgroups"
-	"github.com/cri-o/cri-o/server/metrics"
-	"github.com/cri-o/cri-o/utils"
-	"github.com/cri-o/cri-o/utils/errdefs"
-	"github.com/cri-o/cri-o/utils/fifo"
-	cio "github.com/cri-o/cri-o/utils/io"
-	cioutil "github.com/cri-o/cri-o/utils/ioutil"
-	"github.com/cri-o/cri-o/utils/typeurl"
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -32,6 +26,14 @@ import (
 	"k8s.io/client-go/tools/remotecommand"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	utilexec "k8s.io/utils/exec"
+
+	"github.com/cri-o/cri-o/server/metrics"
+	"github.com/cri-o/cri-o/utils"
+	"github.com/cri-o/cri-o/utils/errdefs"
+	"github.com/cri-o/cri-o/utils/fifo"
+	cio "github.com/cri-o/cri-o/utils/io"
+	cioutil "github.com/cri-o/cri-o/utils/ioutil"
+	"github.com/cri-o/cri-o/utils/typeurl"
 )
 
 const fifoGlobalDir = "/tmp/crio/fifo"
@@ -278,7 +280,7 @@ func (r *runtimeVM) StartContainer(c *Container) error {
 		if err == nil {
 			// create a file on the exitsDir so that cri-o server can detect it
 			path := filepath.Join(r.exitsPath+"/", c.ID())
-			if fileErr := os.WriteFile(path, []byte("Exited"), 0o644); err != nil {
+			if fileErr := ioutil.WriteFile(path, []byte("Exited"), 0o644); err != nil {
 				logrus.Warningf("Unable to write exit file %v", fileErr)
 			}
 			if err1 := r.updateContainerStatus(c); err1 != nil {
@@ -287,7 +289,7 @@ func (r *runtimeVM) StartContainer(c *Container) error {
 		} else {
 			// create a file on the exitsDir so that cri-o server can detect it
 			path := filepath.Join(r.exitsPath+"/", c.ID())
-			if fileErr := os.WriteFile(path, []byte("Exited"), 0o644); err != nil {
+			if fileErr := ioutil.WriteFile(path, []byte("Exited"), 0o644); err != nil {
 				logrus.Warningf("Unable to write exit file2 %v", fileErr)
 			}
 			logrus.Errorf("error wait container terminate %v", err)
