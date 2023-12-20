@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package oci
@@ -13,12 +14,13 @@ import (
 	"time"
 
 	"github.com/containers/libpod/pkg/cgroups"
-	"github.com/cri-o/cri-o/utils"
 	"github.com/opencontainers/runc/libcontainer/cgroups/systemd"
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
+
+	"github.com/cri-o/cri-o/utils"
 )
 
 func createUnitName(prefix, name string) string {
@@ -128,8 +130,12 @@ func (r *runtimeOCI) containerStats(ctr *Container, sandboxParent string) (stats
 	stats.PIDs = cgroupStats.Pids.Current
 	stats.BlockInput, stats.BlockOutput = calculateBlockIO(cgroupStats)
 
-	if ctr.state != nil {
-		netNsPath := fmt.Sprintf("/proc/%d/ns/net", ctr.state.Pid)
+	// Try our best to get the net namespace path.
+	// If pid() errors, the container has stopped, and the /proc entry
+	// won't exist anyway.
+	pid, _ := ctr.pid() // nolint:errcheck
+	if pid > 0 {
+		netNsPath := fmt.Sprintf("/proc/%d/ns/net", pid)
 		stats.NetInput, stats.NetOutput = getContainerNetIO(netNsPath)
 	}
 

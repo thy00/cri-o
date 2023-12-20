@@ -24,7 +24,7 @@ var _ = t.Describe("PodSandboxStatus", func() {
 		It("should succeed", func() {
 			// Given
 			addContainerAndSandbox()
-			testContainer.SetState(&oci.ContainerState{
+			testContainer.SetStateAndSpoofPid(&oci.ContainerState{
 				State: specs.State{Status: oci.ContainerStateRunning},
 			})
 
@@ -40,7 +40,7 @@ var _ = t.Describe("PodSandboxStatus", func() {
 		It("should succeed with multiple IPs", func() {
 			// Given
 			addContainerAndSandbox()
-			testContainer.SetState(&oci.ContainerState{
+			testContainer.SetStateAndSpoofPid(&oci.ContainerState{
 				State: specs.State{Status: oci.ContainerStateRunning},
 			})
 			const (
