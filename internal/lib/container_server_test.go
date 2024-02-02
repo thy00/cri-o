@@ -9,13 +9,14 @@ import (
 	"time"
 
 	"github.com/containers/libpod/pkg/annotations"
-	"github.com/cri-o/cri-o/internal/lib"
-	"github.com/cri-o/cri-o/internal/oci"
-	libconfig "github.com/cri-o/cri-o/pkg/config"
 	"github.com/golang/mock/gomock"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+
+	"github.com/cri-o/cri-o/internal/lib"
+	"github.com/cri-o/cri-o/internal/oci"
+	libconfig "github.com/cri-o/cri-o/pkg/config"
 )
 
 // The actual test suite
@@ -170,6 +171,19 @@ var _ = t.Describe("ContainerServer", func() {
 
 			// Then
 			Expect(err).To(BeNil())
+		})
+
+		It("should succeed load infraContainer", func() {
+			// Given
+			createDummyState()
+			mockDirs(testManifest)
+
+			// When
+			err := sut.LoadSandbox("id")
+
+			// Then
+			Expect(err).To(BeNil())
+			Expect(sut.GetInfraContainer(sandboxID)).NotTo(BeNil())
 		})
 
 		It("should succeed with invalid network namespace", func() {

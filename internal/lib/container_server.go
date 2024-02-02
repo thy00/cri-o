@@ -14,16 +14,17 @@ import (
 	cstorage "github.com/containers/storage"
 	"github.com/containers/storage/pkg/ioutils"
 	"github.com/containers/storage/pkg/truncindex"
-	"github.com/cri-o/cri-o/internal/lib/sandbox"
-	"github.com/cri-o/cri-o/internal/oci"
-	"github.com/cri-o/cri-o/internal/storage"
-	libconfig "github.com/cri-o/cri-o/pkg/config"
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	pb "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 	"k8s.io/kubernetes/pkg/kubelet/dockershim/network/hostport"
+
+	"github.com/cri-o/cri-o/internal/lib/sandbox"
+	"github.com/cri-o/cri-o/internal/oci"
+	"github.com/cri-o/cri-o/internal/storage"
+	libconfig "github.com/cri-o/cri-o/pkg/config"
 )
 
 // ContainerManagerCRIO specifies an annotation value which indicates that the
@@ -302,6 +303,9 @@ func (c *ContainerServer) LoadSandbox(id string) (retErr error) {
 	if err := sb.SetInfraContainer(scontainer); err != nil {
 		return err
 	}
+
+	// We should restore the infraContainer to the container state store
+	c.AddInfraContainer(scontainer)
 
 	sb.RestoreStopped()
 
