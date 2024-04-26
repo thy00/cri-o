@@ -4,13 +4,13 @@ package lockfile
 
 import (
 	"bytes"
-	cryptorand `crypto/rand`
-	`encoding/binary`
+	cryptorand "crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"sync"
-	"time"
 	"sync/atomic"
+	"time"
 
 	"github.com/pkg/errors"
 	"golang.org/x/sys/unix"

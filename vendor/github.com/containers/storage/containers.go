@@ -75,43 +75,25 @@ type ContainerStore interface {
 	ContainerBigDataStore
 	FlaggableStore
 
-	// Acquire a writer lock.
-	// The default unix implementation panics if:
-	// - opening the lockfile failed
-	// - tried to lock a read-only lock-file
-	Lock()
+	// startWriting makes sure the store is fresh, and locks it for writing.
+	// If this succeeds, the caller MUST call stopWriting().
+	startWriting() error
 
-	// Unlock the lock.
-	// The default unix implementation panics if:
-	// - unlocking an unlocked lock
-	// - if the lock counter is corrupted
-	Unlock()
+	// stopWriting releases locks obtained by startWriting.
+	stopWriting()
 
-	// Acquire a reader lock.
-	RLock()
+	// startReading makes sure the store is fresh, and locks it for reading.
+	// If this succeeds, the caller MUST call stopReading().
+	startReading() error
 
-	// Touch records, for others sharing the lock, that the caller was the
-	// last writer.  It should only be called with the lock held.
-	Touch() error
-
-	// Modified() checks if the most recent writer was a party other than the
-	// last recorded writer.  It should only be called with the lock held.
-	Modified() (bool, error)
+	// stopReading releases locks obtained by startReading.
+	stopReading()
 
 	// TouchedSince() checks if the most recent writer modified the file (likely using Touch()) after the specified time.
 	TouchedSince(when time.Time) bool
 
 	// IsReadWrite() checks if the lock file is read-write
 	IsReadWrite() bool
-
-	// Locked() checks if lock is locked for writing by a thread in this process
-	Locked() bool
-	// Load reloads the contents of the store from disk.  It should be called
-	// with the lock held.
-	Load() error
-
-	// ReloadIfChanged reloads the contents of the store from disk if it is changed.
-	ReloadIfChanged() error
 
 	// Save saves the contents of the store to disk.  It should be called with
 	// the lock held, and Touch() should be called afterward before releasing the
@@ -209,6 +191,111 @@ func (c *Container) MountOpts() []string {
 	}
 }
 
+// startWritingWithReload makes sure the store is fresh if canReload, and locks it for writing.
+// If this succeeds, the caller MUST call stopWriting().
+//
+// This is an internal implementation detail of containerStore construction, every other caller
+// should use startWriting() instead.
+func (r *containerStore) startWritingWithReload(canReload bool) error {
+	r.lockfile.Lock()
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			r.lockfile.Unlock()
+		}
+	}()
+
+	if canReload {
+		if _, err := r.reloadIfChanged(true); err != nil {
+			return err
+		}
+	}
+
+	succeeded = true
+	return nil
+}
+
+// startWriting makes sure the store is fresh, and locks it for writing.
+// If this succeeds, the caller MUST call stopWriting().
+func (r *containerStore) startWriting() error {
+	return r.startWritingWithReload(true)
+}
+
+// stopWriting releases locks obtained by startWriting.
+func (r *containerStore) stopWriting() {
+	r.lockfile.Unlock()
+}
+
+// startReading makes sure the store is fresh, and locks it for reading.
+// If this succeeds, the caller MUST call stopReading().
+func (r *containerStore) startReading() error {
+	r.lockfile.RLock()
+	unlockFn := r.lockfile.Unlock // A function to call to clean up, or nil
+	defer func() {
+		if unlockFn != nil {
+			unlockFn()
+		}
+	}()
+
+	if tryLockedForWriting, err := r.reloadIfChanged(false); err != nil {
+		if !tryLockedForWriting {
+			return err
+		}
+		unlockFn()
+		unlockFn = nil
+
+		r.lockfile.Lock()
+		unlockFn = r.lockfile.Unlock
+		if _, err := r.load(true); err != nil {
+			return err
+		}
+		unlockFn()
+		unlockFn = nil
+
+		r.lockfile.RLock()
+		unlockFn = r.lockfile.Unlock
+		// We need to check for a reload reload once more because the on-disk state could have been modified
+		// after we released the lock.
+		// If that, _again_, finds inconsistent state, just give up.
+		// We could, plausibly, retry a few times, but that inconsistent state (duplicate container names)
+		// shouldn’t be saved (by correct implementations) in the first place.
+		if _, err := r.reloadIfChanged(false); err != nil {
+			return fmt.Errorf("(even after successfully cleaning up once:) %w", err)
+		}
+	}
+
+	unlockFn = nil
+	return nil
+}
+
+// stopReading releases locks obtained by startReading.
+func (r *containerStore) stopReading() {
+	r.lockfile.Unlock()
+}
+
+// reloadIfChanged reloads the contents of the store from disk if it is changed.
+//
+// The caller must hold r.lockfile for reading _or_ writing; lockedForWriting is true
+// if it is held for writing.
+//
+// If !lockedForWriting and this function fails, the return value indicates whether
+// load() with lockedForWriting could succeed. In that case the caller MUST
+// call load(), not reloadIfChanged() (because the “if changed” state will not
+// be detected again).
+func (r *containerStore) reloadIfChanged(lockedForWriting bool) (bool, error) {
+	r.loadMut.Lock()
+	defer r.loadMut.Unlock()
+
+	modified, err := r.lockfile.Modified()
+	if err != nil {
+		return false, err
+	}
+	if modified {
+		return r.load(lockedForWriting)
+	}
+	return false, nil
+}
+
 func (r *containerStore) Containers() ([]Container, error) {
 	containers := make([]Container, len(r.containers))
 	for i := range r.containers {
@@ -229,48 +316,62 @@ func (r *containerStore) datapath(id, key string) string {
 	return filepath.Join(r.datadir(id), makeBigDataBaseName(key))
 }
 
-func (r *containerStore) Load() error {
-	needSave := false
+// load reloads the contents of the store from disk.
+//
+// The caller must hold r.lockfile for reading _or_ writing; lockedForWriting is true
+// if it is held for writing.
+//
+// If !lockedForWriting and this function fails, the return value indicates whether
+// retrying with lockedForWriting could succeed.
+func (r *containerStore) load(lockedForWriting bool) (bool, error) {
 	rpath := r.containerspath()
 	data, err := ioutil.ReadFile(rpath)
 	if err != nil && !os.IsNotExist(err) {
-		return err
+		return false, err
 	}
+
 	containers := []*Container{}
-	layers := make(map[string]*Container)
-	idlist := []string{}
-	ids := make(map[string]*Container)
-	names := make(map[string]*Container)
-	if err = json.Unmarshal(data, &containers); len(data) == 0 || err == nil {
-		idlist = make([]string, 0, len(containers))
-		for n, container := range containers {
-			idlist = append(idlist, container.ID)
-			ids[container.ID] = containers[n]
-			layers[container.LayerID] = containers[n]
-			for _, name := range container.Names {
-				if conflict, ok := names[name]; ok {
-					r.removeName(conflict, name)
-					needSave = true
-				}
-				names[name] = containers[n]
-			}
+	if len(data) != 0 {
+		if err := json.Unmarshal(data, &containers); err != nil {
+			return false, fmt.Errorf("loading %q: %w", rpath, err)
 		}
 	}
+	idlist := make([]string, 0, len(containers))
+	layers := make(map[string]*Container)
+	ids := make(map[string]*Container)
+	names := make(map[string]*Container)
+	var errorToResolveBySaving error // == nil
+	for n, container := range containers {
+		idlist = append(idlist, container.ID)
+		ids[container.ID] = containers[n]
+		layers[container.LayerID] = containers[n]
+		for _, name := range container.Names {
+			if conflict, ok := names[name]; ok {
+				r.removeName(conflict, name)
+				errorToResolveBySaving = errors.New("container store is inconsistent and the current caller does not hold a write lock")
+			}
+			names[name] = containers[n]
+		}
+	}
+
 	r.containers = containers
 	r.idindex = truncindex.NewTruncIndex(idlist)
 	r.byid = ids
 	r.bylayer = layers
 	r.byname = names
-	if needSave {
-		return r.Save()
+	if errorToResolveBySaving != nil {
+		if !lockedForWriting {
+			// Eventually, the callers should be modified to retry with a write lock, instead.
+			return true, errorToResolveBySaving
+		}
+		return false, r.Save()
 	}
-	return nil
+	return false, nil
 }
 
+// the lock held, locked for writing.
 func (r *containerStore) Save() error {
-	if !r.Locked() {
-		return errors.New("container store is not locked")
-	}
+	r.lockfile.AssertLockedForWriting()
 	rpath := r.containerspath()
 	if err := os.MkdirAll(filepath.Dir(rpath), 0700); err != nil {
 		return err
@@ -279,8 +380,10 @@ func (r *containerStore) Save() error {
 	if err != nil {
 		return err
 	}
-	defer r.Touch()
-	return ioutils.AtomicWriteFile(rpath, jdata, 0600)
+	if err := ioutils.AtomicWriteFile(rpath, jdata, 0600); err != nil {
+		return err
+	}
+	return r.lockfile.Touch()
 }
 
 func newContainerStore(dir string) (ContainerStore, error) {
@@ -291,8 +394,6 @@ func newContainerStore(dir string) (ContainerStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	lockfile.Lock()
-	defer lockfile.Unlock()
 	cstore := containerStore{
 		lockfile:   lockfile,
 		dir:        dir,
@@ -301,7 +402,11 @@ func newContainerStore(dir string) (ContainerStore, error) {
 		bylayer:    make(map[string]*Container),
 		byname:     make(map[string]*Container),
 	}
-	if err := cstore.Load(); err != nil {
+	if err := cstore.startWritingWithReload(false); err != nil {
+		return nil, err
+	}
+	defer cstore.stopWriting()
+	if _, err := cstore.load(true); err != nil {
 		return nil, err
 	}
 	return &cstore, nil
@@ -623,28 +728,8 @@ func (r *containerStore) Wipe() error {
 	return nil
 }
 
-func (r *containerStore) Lock() {
-	r.lockfile.Lock()
-}
-
 func (r *containerStore) RecursiveLock() {
 	r.lockfile.RecursiveLock()
-}
-
-func (r *containerStore) RLock() {
-	r.lockfile.RLock()
-}
-
-func (r *containerStore) Unlock() {
-	r.lockfile.Unlock()
-}
-
-func (r *containerStore) Touch() error {
-	return r.lockfile.Touch()
-}
-
-func (r *containerStore) Modified() (bool, error) {
-	return r.lockfile.Modified()
 }
 
 func (r *containerStore) IsReadWrite() bool {
@@ -653,19 +738,4 @@ func (r *containerStore) IsReadWrite() bool {
 
 func (r *containerStore) TouchedSince(when time.Time) bool {
 	return r.lockfile.TouchedSince(when)
-}
-
-func (r *containerStore) Locked() bool {
-	return r.lockfile.Locked()
-}
-
-func (r *containerStore) ReloadIfChanged() error {
-	r.loadMut.Lock()
-	defer r.loadMut.Unlock()
-
-	modified, err := r.Modified()
-	if err == nil && modified {
-		return r.Load()
-	}
-	return nil
 }
