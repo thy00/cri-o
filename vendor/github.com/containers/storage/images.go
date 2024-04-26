@@ -18,7 +18,7 @@ import (
 	"github.com/containers/storage/pkg/truncindex"
 )
 
-const 
+const (
 	// ImageDigestManifestBigDataNamePrefix is a prefix of big data item
 	// names which we consider to be manifests, used for computing a
 	// "digest" value for the image as a whole, by which we can locate the
