@@ -3,7 +3,7 @@ let
   pkgs = import ./nixpkgs.nix {
     config = {
       packageOverrides = pkg: {
-        go_1_12 = pkg.go_1_14;
+        go_1_12 = pkg.go_1_15;
       };
     };
   };
