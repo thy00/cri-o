@@ -1,4 +1,4 @@
-go 1.14
+go 1.15
 
 module github.com/cri-o/cri-o
 
@@ -23,7 +23,6 @@ require (
 	github.com/creack/pty v1.1.11
 	github.com/cri-o/ocicni v0.2.1-0.20200422173648-513ef787b8c9
 	github.com/cyphar/filepath-securejoin v0.2.2
-	github.com/docker/docker v1.4.2-0.20191219165747-a9416c67da9f // indirect
 	github.com/docker/go-units v0.4.0
 	github.com/fsnotify/fsnotify v1.4.9
 	github.com/go-zoo/bone v1.3.0
@@ -68,6 +67,7 @@ require (
 )
 
 replace (
+	github.com/containers/storage v1.19.2 => ../storage
 	github.com/godbus/dbus => github.com/godbus/dbus v0.0.0-20190623212516-8a1682060722
 	github.com/prometheus/client_golang => github.com/prometheus/client_golang v0.9.2
 	github.com/sirupsen/logrus => github.com/sirupsen/logrus v1.4.2
