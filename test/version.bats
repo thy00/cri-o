@@ -13,10 +13,14 @@ load helpers
     [[ "$output" =~ "Version:" ]]
     [[ "$output" =~ "GitCommit:" ]]
     [[ "$output" =~ "GitTreeState:" ]]
+    if [[ "$output" =~ "Linkmode: dynamic" ]]; then
+        [[ "$output" =~ "BuildDate:" ]]
+    fi
     [[ "$output" =~ "BuildDate:" ]]
     [[ "$output" =~ "GoVersion:" ]]
     [[ "$output" =~ "Compiler:" ]]
     [[ "$output" =~ "Platform:" ]]
+    [[ "$output" =~ "Linkmode:" ]]
 }
 
 @test "version should succeed with JSON" {
@@ -28,6 +32,10 @@ load helpers
     JSON="$output"
     echo $JSON | jq --exit-status '.gitCommit != ""'
     [ "$status" -eq 0 ]
+
+    if echo $JSON | jq -r '.linkmode == "dynamic"'; then
+     echo $JSON | jq --exit-status '.buildDate != ""'
+    fi
 
     echo $JSON | jq --exit-status '.buildDate != ""'
     [ "$status" -eq 0 ]
@@ -45,5 +53,8 @@ load helpers
     [ "$status" -eq 0 ]
 
     echo $JSON | jq --exit-status '.version != ""'
+    [ "$status" -eq 0 ]
+
+    echo $JSON | jq --exit-status '.linkmode != ""'
     [ "$status" -eq 0 ]
 }

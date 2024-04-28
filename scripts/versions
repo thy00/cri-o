@@ -3,6 +3,7 @@ set -euo pipefail
 
 # Versions to be used
 declare -A VERSIONS=(
+    ["go"]=1.15.15
     ["cni-plugins"]=v0.8.5
     ["conmon"]=v2.0.15
     ["cri-tools"]=v1.18.0

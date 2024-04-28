@@ -12,7 +12,7 @@ ZSHINSTALLDIR ?= $(PREFIX)/share/zsh/site-functions
 SYSTEMDDIR ?= $(PREFIX)/lib/systemd/system
 OPT_CNI_BIN_DIR ?= /opt/cni/bin
 
-all: install
+ARCH ?= amd64
 
 .PHONY: install
 install: \
@@ -43,9 +43,8 @@ install-crio:
 	install $(SELINUX) -d -m 755 $(FISHINSTALLDIR)
 	install $(SELINUX) -d -m 755 $(ZSHINSTALLDIR)
 	install $(SELINUX) -d -m 755 $(CONTAINERS_DIR)
-	install $(SELINUX) -D -m 755 -t $(BINDIR) bin/crio-status-static
-	install $(SELINUX) -D -m 755 -t $(BINDIR) bin/crio-static
-	ln -sf $(BINDIR)/crio-static $(BINDIR)/crio
+	install $(SELINUX) -D -m 755 -t $(BINDIR) bin/crio-status
+	install $(SELINUX) -D -m 755 -t $(BINDIR) bin/crio
 	install $(SELINUX) -D -m 644 -t $(ETCDIR) etc/crictl.yaml
 	install $(SELINUX) -D -m 644 -t $(OCIDIR) etc/crio-umount.conf
 	install $(SELINUX) -D -m 644 -t $(ETCDIR)/crio etc/crio.conf
@@ -64,7 +63,9 @@ install-pinns:
 
 .PHONY: install-runc
 install-runc:
+ifeq ($(ARCH),amd64)
 	install $(SELINUX) -D -m 755 -t $(BINDIR) bin/runc
+endif
 
 .PHONY: uninstall
 uninstall: \
@@ -91,8 +92,7 @@ uninstall-crictl:
 .PHONY: uninstall-crio
 uninstall-crio:
 	rm $(BINDIR)/crio
-	rm $(BINDIR)/crio-status-static
-	rm $(BINDIR)/crio-static
+	rm $(BINDIR)/crio-status
 	rm $(ETCDIR)/crictl.yaml
 	rm $(OCIDIR)/crio-umount.conf
 	rm $(ETCDIR)/crio/crio.conf
@@ -110,5 +110,6 @@ uninstall-pinns:
 	rm $(BINDIR)/pinns
 
 .PHONY: uninstall-runc
-uninstall-runc:
+ifeq ($(ARCH),amd64)
 	rm $(BINDIR)/runc
+endif
