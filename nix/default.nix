@@ -7,6 +7,15 @@ let
         libassuan = (static pkg.libassuan);
         libgpgerror = (static pkg.libgpgerror);
         libseccomp = (static pkg.libseccomp);
+        glib = (static pkg.glib).overrideAttrs(x: {
+          outputs = [ "bin" "out" "dev" ];
+          mesonFlags = [
+            "-Ddefault_library=static"
+            "-Ddevbindir=${placeholder ''dev''}/bin"
+            "-Dgtk_doc=false"
+            "-Dnls=disabled"
+          ];
+        });
       };
     };
   });
@@ -35,7 +44,7 @@ let
       export CFLAGS='-static -pthread'
       export LDFLAGS='-s -w -static-libgcc -static'
       export EXTRA_LDFLAGS='-s -w -linkmode external -extldflags "-static -lm"'
-      export BUILDTAGS='static netgo exclude_graphdriver_btrfs exclude_graphdriver_devicemapper seccomp apparmor selinux'
+      export BUILDTAGS='static netgo osusergo exclude_graphdriver_btrfs exclude_graphdriver_devicemapper seccomp apparmor selinux'
     '';
     buildPhase = ''
       patchShebangs .
