@@ -26,16 +26,17 @@ import (
 	"sync"
 	"unsafe"
 
-	graphdriver "github.com/containers/storage/drivers"
-	"github.com/containers/storage/pkg/idtools"
-	"github.com/containers/storage/pkg/mount"
-	"github.com/containers/storage/pkg/parsers"
-	"github.com/containers/storage/pkg/system"
 	"github.com/docker/go-units"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
+
+	graphdriver "github.com/containers/storage/drivers"
+	"github.com/containers/storage/pkg/idtools"
+	"github.com/containers/storage/pkg/mount"
+	"github.com/containers/storage/pkg/parsers"
+	"github.com/containers/storage/pkg/system"
 )
 
 func init() {
@@ -503,6 +504,11 @@ func (d *Driver) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts
 
 // Create the filesystem with given id.
 func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
+
+	defer func() {
+		logrus.Warnf("create btrfs end %s", id)
+	}()
+
 	quotas := path.Join(d.home, "quotas")
 	subvolumes := path.Join(d.home, "subvolumes")
 	rootUID, rootGID, err := idtools.GetRootUIDGID(d.uidMaps, d.gidMaps)

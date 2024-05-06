@@ -16,6 +16,13 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/docker/go-units"
+	rsystem "github.com/opencontainers/runc/libcontainer/system"
+	"github.com/opencontainers/selinux/go-selinux/label"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
+
 	graphdriver "github.com/containers/storage/drivers"
 	"github.com/containers/storage/drivers/overlayutils"
 	"github.com/containers/storage/drivers/quota"
@@ -28,12 +35,6 @@ import (
 	"github.com/containers/storage/pkg/mount"
 	"github.com/containers/storage/pkg/parsers"
 	"github.com/containers/storage/pkg/system"
-	units "github.com/docker/go-units"
-	rsystem "github.com/opencontainers/runc/libcontainer/system"
-	"github.com/opencontainers/selinux/go-selinux/label"
-	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
-	"golang.org/x/sys/unix"
 )
 
 var (
@@ -541,6 +542,14 @@ func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 
 func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr error) {
 	dir := d.dir(id)
+	
+	defer func() {
+		logrus.Warnf("create overlay end %s", dir)
+		if retErr != nil {
+			logrus.Warnf("create overlay end %s, with err: %s", dir, retErr)
+		}
+
+	}()
 
 	uidMaps := d.uidMaps
 	gidMaps := d.gidMaps

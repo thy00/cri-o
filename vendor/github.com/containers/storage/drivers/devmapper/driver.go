@@ -9,14 +9,15 @@ import (
 	"path"
 	"strconv"
 
+	"github.com/docker/go-units"
+	"github.com/sirupsen/logrus"
+
 	graphdriver "github.com/containers/storage/drivers"
 	"github.com/containers/storage/pkg/devicemapper"
 	"github.com/containers/storage/pkg/idtools"
 	"github.com/containers/storage/pkg/locker"
 	"github.com/containers/storage/pkg/mount"
 	"github.com/containers/storage/pkg/system"
-	units "github.com/docker/go-units"
-	"github.com/sirupsen/logrus"
 )
 
 func init() {
@@ -136,6 +137,11 @@ func (d *Driver) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts
 
 // Create adds a device with a given id and the parent.
 func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
+
+	defer func() {
+		logrus.Warnf("create driver end %s", id)
+	}()
+
 	var storageOpt map[string]string
 	if opts != nil {
 		storageOpt = opts.StorageOpt

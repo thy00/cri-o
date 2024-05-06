@@ -35,6 +35,13 @@ import (
 	"sync"
 	"time"
 
+	rsystem "github.com/opencontainers/runc/libcontainer/system"
+	"github.com/opencontainers/selinux/go-selinux/label"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
+	"github.com/vbatts/tar-split/tar/storage"
+	"golang.org/x/sys/unix"
+
 	graphdriver "github.com/containers/storage/drivers"
 	"github.com/containers/storage/pkg/archive"
 	"github.com/containers/storage/pkg/chrootarchive"
@@ -44,12 +51,6 @@ import (
 	mountpk "github.com/containers/storage/pkg/mount"
 	"github.com/containers/storage/pkg/parsers"
 	"github.com/containers/storage/pkg/system"
-	rsystem "github.com/opencontainers/runc/libcontainer/system"
-	"github.com/opencontainers/selinux/go-selinux/label"
-	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
-	"github.com/vbatts/tar-split/tar/storage"
-	"golang.org/x/sys/unix"
 )
 
 var (
@@ -270,6 +271,10 @@ func (a *Driver) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts
 // Create three folders for each id
 // mnt, layers, and diff
 func (a *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
+
+	defer func() {
+		logrus.Warnf("create aufs end %s", id)
+	}()
 
 	if opts != nil && len(opts.StorageOpt) != 0 {
 		return fmt.Errorf("--storage-opt is not supported for aufs")
