@@ -8,14 +8,13 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/opencontainers/selinux/go-selinux/label"
-	"github.com/sirupsen/logrus"
-
 	graphdriver "github.com/containers/storage/drivers"
 	"github.com/containers/storage/pkg/archive"
 	"github.com/containers/storage/pkg/idtools"
 	"github.com/containers/storage/pkg/parsers"
 	"github.com/containers/storage/pkg/system"
+	"github.com/opencontainers/selinux/go-selinux/label"
+	"github.com/sirupsen/logrus"
 )
 
 var (
@@ -130,11 +129,6 @@ func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
 }
 
 func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts, ro bool) (retErr error) {
-
-	defer func() {
-		logrus.Warnf("create vfs driver end %s", id)
-	}()
-
 	if opts != nil && len(opts.StorageOpt) != 0 {
 		return fmt.Errorf("--storage-opt is not supported for vfs")
 	}

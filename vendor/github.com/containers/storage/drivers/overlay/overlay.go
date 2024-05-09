@@ -17,7 +17,7 @@ import (
 	"syscall"
 
 	"github.com/docker/go-units"
-	`github.com/hashicorp/go-multierror`
+	"github.com/hashicorp/go-multierror"
 	rsystem "github.com/opencontainers/runc/libcontainer/system"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
@@ -543,13 +543,11 @@ func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 
 func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr error) {
 	dir := d.dir(id)
-	
+
 	defer func() {
-		logrus.Warnf("create overlay end %s", dir)
 		if retErr != nil {
 			logrus.Warnf("create overlay end %s, with err: %s", dir, retErr)
 		}
-
 	}()
 
 	uidMaps := d.uidMaps
@@ -562,29 +560,24 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 
 	rootUID, rootGID, err := idtools.GetRootUIDGID(uidMaps, gidMaps)
 	if err != nil {
-		logrus.Warnf("create overlay 1 end %s, with err: %s", dir, err)
 		return err
 	}
 	// Make the link directory if it does not exist
 	if err := idtools.MkdirAllAs(path.Join(d.home, linkDir), 0700, rootUID, rootGID); err != nil && !os.IsExist(err) {
-		logrus.Warnf("create overlay 2 end %s, with err: %s", dir, err)
 		return err
 	}
 	if err := idtools.MkdirAllAs(path.Dir(dir), 0700, rootUID, rootGID); err != nil {
-		logrus.Warnf("create overlay 3 end %s, with err: %s", dir, err)
 		return err
 	}
 	if parent != "" {
 		st, err := system.Stat(d.dir(parent))
 		if err != nil {
-			logrus.Warnf("create overlay 4 end %s, with err: %s", dir, err)
 			return err
 		}
 		rootUID = int(st.UID())
 		rootGID = int(st.GID())
 	}
 	if err := idtools.MkdirAs(dir, 0700, rootUID, rootGID); err != nil {
-		logrus.Warnf("create overlay 5 end %s, with err: %s", dir, err)
 		return err
 	}
 
@@ -598,42 +591,35 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 	if opts != nil && len(opts.StorageOpt) > 0 {
 		driver := &Driver{}
 		if err := d.parseStorageOpt(opts.StorageOpt, driver); err != nil {
-			logrus.Warnf("create overlay 6 end %s, with err: %s", dir, err)
 			return err
 		}
 
 		if driver.options.quota.Size > 0 {
 			// Set container disk quota limit
 			if err := d.quotaCtl.SetQuota(dir, driver.options.quota); err != nil {
-				logrus.Warnf("create overlay 7 end %s, with err: %s", dir, err)
 				return err
 			}
 		}
 	}
 
 	if err := idtools.MkdirAs(path.Join(dir, "diff"), 0755, rootUID, rootGID); err != nil {
-		logrus.Warnf("create overlay 8 end %s, with err: %s", dir, err)
 		return err
 	}
 
 	lid := generateID(idLength)
 	if err := os.Symlink(path.Join("..", id, "diff"), path.Join(d.home, linkDir, lid)); err != nil {
-		logrus.Warnf("create overlay 9 end %s, with err: %s", dir, err)
 		return err
 	}
 
 	// Write link id to link file
 	if err := ioutil.WriteFile(path.Join(dir, "link"), []byte(lid), 0644); err != nil {
-		logrus.Warnf("create overlay 10 end %s, with err: %s", dir, err)
 		return err
 	}
 
 	if err := idtools.MkdirAs(path.Join(dir, "work"), 0700, rootUID, rootGID); err != nil {
-		logrus.Warnf("create overlay 11 end %s, with err: %s", dir, err)
 		return err
 	}
 	if err := idtools.MkdirAs(path.Join(dir, "merged"), 0700, rootUID, rootGID); err != nil {
-		logrus.Warnf("create overlay 12 end %s, with err: %s", dir, err)
 		return err
 	}
 
@@ -644,12 +630,10 @@ func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 
 	lower, err := d.getLower(parent)
 	if err != nil {
-		logrus.Warnf("create overlay 13 end %s, with err: %s", dir, err)
 		return err
 	}
 	if lower != "" {
 		if err := ioutil.WriteFile(path.Join(dir, lowerFile), []byte(lower), 0666); err != nil {
-			logrus.Warnf("create overlay 14 end %s, with err: %s", dir, err)
 			return err
 		}
 	}
@@ -887,6 +871,7 @@ func (d *Driver) recreateSymlinks() error {
 		}
 	}
 	if errs != nil {
+		logrus.Warnf("recreateSymlinks fail: %s", errs.Error())
 		return errs.ErrorOrNil()
 	}
 	return nil
@@ -967,6 +952,7 @@ func (d *Driver) get(id string, disableShifting bool, options graphdriver.MountO
 			if lower == "" && os.IsNotExist(err) {
 				logrus.Warnf("Can't stat lower layer %q because it does not exist. Going through storage to recreate the missing symlinks.", newpath)
 				if err := d.recreateSymlinks(); err != nil {
+					logrus.Warnf("error recreating the missing symlinks: %v", err)
 					return "", fmt.Errorf("error recreating the missing symlinks: %v", err)
 				}
 				lower = newpath

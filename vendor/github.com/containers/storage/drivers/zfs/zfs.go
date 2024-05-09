@@ -12,16 +12,15 @@ import (
 	"sync"
 	"time"
 
+	graphdriver "github.com/containers/storage/drivers"
+	"github.com/containers/storage/pkg/idtools"
+	"github.com/containers/storage/pkg/mount"
+	"github.com/containers/storage/pkg/parsers"
 	"github.com/mistifyio/go-zfs"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
-
-	graphdriver "github.com/containers/storage/drivers"
-	"github.com/containers/storage/pkg/idtools"
-	"github.com/containers/storage/pkg/mount"
-	"github.com/containers/storage/pkg/parsers"
 )
 
 type zfsOptions struct {
@@ -273,12 +272,6 @@ func (d *Driver) CreateReadWrite(id, parent string, opts *graphdriver.CreateOpts
 
 // Create prepares the dataset and filesystem for the ZFS driver for the given id under the parent.
 func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) error {
-
-
-	defer func() {
-		logrus.Warnf("create zfs end %s", id)
-	}()
-
 	var storageOpt map[string]string
 	if opts != nil {
 		storageOpt = opts.StorageOpt
