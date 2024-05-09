@@ -7,7 +7,7 @@ require (
 	github.com/Microsoft/go-winio v0.4.15-0.20190919025122-fc70bd9a86b5
 	github.com/blang/semver v3.5.1+incompatible
 	github.com/containerd/cgroups v0.0.0-20191003151125-bec0ecbda146 // indirect
-	github.com/containerd/containerd v1.3.0
+	github.com/containerd/containerd v1.3.2
 	github.com/containerd/go-runc v0.0.0-20190603165425-9007c2405372 // indirect
 	github.com/containerd/project v0.0.0-20190513184420-7fb81da5e663
 	github.com/containerd/ttrpc v0.0.0-20190828154514-0e0f228740de
@@ -64,7 +64,7 @@ require (
 )
 
 replace (
-    github.com/containers/storage v1.19.1 => github.com/thy00/storage v1.19.3
+	github.com/containers/storage v1.19.1 => github.com/thy00/storage v1.19.3
 	github.com/godbus/dbus => github.com/godbus/dbus v0.0.0-20190623212516-8a1682060722
 	github.com/opencontainers/runtime-spec => github.com/opencontainers/runtime-spec v0.1.2-0.20190408193819-a1b50f621a48
 	github.com/prometheus/client_golang => github.com/prometheus/client_golang v0.9.2
