@@ -544,6 +544,12 @@ func (d *Driver) Create(id, parent string, opts *graphdriver.CreateOpts) (retErr
 func (d *Driver) create(id, parent string, opts *graphdriver.CreateOpts) (retErr error) {
 	dir := d.dir(id)
 
+	defer func() {
+		if retErr != nil {
+			logrus.Warnf("create overlay end %s, with err: %s", dir, retErr)
+		}
+	}()
+
 	uidMaps := d.uidMaps
 	gidMaps := d.gidMaps
 
