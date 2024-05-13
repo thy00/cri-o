@@ -1,6 +1,10 @@
 let
   static = import ./static.nix;
+
   pkgs = (import ./nixpkgs.nix {
+    crossSystem = {
+      config = "aarch64-unknown-linux-gnu";
+    };
     config = {
       packageOverrides = pkg: {
         gpgme = (static pkg.gpgme);
@@ -11,9 +15,6 @@ let
           libusb1 = null;
           pcsclite = null;
         };
-        go = pkgs.go.overrideAttrs (oldAttrs: {
-          doCheck = false;
-        });
       };
     };
   });
