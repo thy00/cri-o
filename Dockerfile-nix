@@ -1,8 +1,21 @@
-# vim: set syntax=dockerfile:
-FROM nixos/nix
-RUN apk add git
+FROM nixos/nix:2.5.1
+ARG TARGETARCH
+
+RUN mkdir -p /etc/nix && echo "filter-syscalls = false" >> /etc/nix/nix.conf
 COPY . /cri-o
 WORKDIR cri-o/nix
-RUN nix-build
+RUN cp --remove-destination $(readlink -f /etc/group) /etc/
+
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+        echo "Running x86_64 specific commands" && \
+        nix-build --extra-experimental-features nix-command \
+        ; \
+    elif [ "$TARGETARCH" = "arm64" ]; then \
+        echo "Running arm64 specific commands" && \
+        nix-build --extra-experimental-features nix-command default-arm64.nix \
+        ; \
+    else \
+        echo "Unsupported architecture: $TARGETARCH" && exit 1; \
+    fi
 WORKDIR /
 RUN rm -rf cri-o
