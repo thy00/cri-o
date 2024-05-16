@@ -197,7 +197,7 @@ func libctrCgroupManager(sbParent, containerCgroup string) (libctr.Manager, erro
 	if node.CgroupIsV2() {
 		return fs2.NewManager(cg, "")
 	}
-	return fs.NewManager(cg, map[string]string{}), nil
+	return fs.NewManager(cg, map[string]string{})
 }
 
 func containerCgroupPath(id string) string {

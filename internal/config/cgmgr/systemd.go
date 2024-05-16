@@ -11,9 +11,6 @@ import (
 
 	"github.com/containers/podman/v4/pkg/rootless"
 	systemdDbus "github.com/coreos/go-systemd/v22/dbus"
-	"github.com/cri-o/cri-o/internal/config/node"
-	"github.com/cri-o/cri-o/internal/dbusmgr"
-	"github.com/cri-o/cri-o/utils"
 	"github.com/godbus/dbus/v5"
 	"github.com/opencontainers/runc/libcontainer/cgroups/systemd"
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
@@ -21,6 +18,10 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 	types "k8s.io/cri-api/pkg/apis/runtime/v1"
+
+	"github.com/cri-o/cri-o/internal/config/node"
+	"github.com/cri-o/cri-o/internal/dbusmgr"
+	"github.com/cri-o/cri-o/utils"
 )
 
 const defaultSystemdParent = "system.slice"

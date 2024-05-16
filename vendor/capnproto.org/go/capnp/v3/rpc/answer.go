@@ -52,7 +52,7 @@ type answer struct {
 	// results message because CapTable cannot be used once results are
 	// sent.  However, the capabilities need to be retained for promised
 	// answer targets.
-	resultCapTable []*capnp.Client
+	resultCapTable []capnp.Client
 
 	// exportRefs is the number of references to exports placed in the
 	// results.
@@ -123,7 +123,9 @@ func (c *Conn) newReturn(ctx context.Context) (rpccp.Return, func(), capnp.Relea
 			send:    send,
 			release: release,
 			callback: func(err error) {
-				c.er.ReportError(fmt.Errorf("send return: %w", err))
+				if err != nil {
+					c.er.ReportError(fmt.Errorf("send return: %w", err))
+				}
 			},
 		})
 	}, release, nil
@@ -161,12 +163,12 @@ func (ans *answer) AllocResults(sz capnp.ObjectSize) (capnp.Struct, error) {
 
 // setBootstrap sets the results to an interface pointer, stealing the
 // reference.
-func (ans *answer) setBootstrap(c *capnp.Client) error {
+func (ans *answer) setBootstrap(c capnp.Client) error {
 	if ans.ret.HasResults() || len(ans.ret.Message().CapTable) > 0 || len(ans.resultCapTable) > 0 {
 		panic("setBootstrap called after creating results")
 	}
 	// Add the capability to the table early to avoid leaks if setBootstrap fails.
-	ans.resultCapTable = []*capnp.Client{c}
+	ans.resultCapTable = []capnp.Client{c}
 
 	var err error
 	ans.results, err = ans.ret.NewResults()
@@ -232,7 +234,9 @@ func (ans *answer) sendReturn() (releaseList, error) {
 
 	var err error
 	ans.exportRefs, err = ans.c.fillPayloadCapTable(ans.results, ans.resultCapTable)
-	ans.c.er.ReportError(rpcerr.Annotate(err, "send return")) // nop if err == nil
+	if err != nil {
+		ans.c.er.ReportError(rpcerr.Annotate(err, "send return"))
+	}
 	// Continue.  Don't fail to send return if cap table isn't fully filled.
 
 	select {

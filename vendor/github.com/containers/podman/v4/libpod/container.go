@@ -2,8 +2,9 @@ package libpod
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -19,8 +20,8 @@ import (
 	"github.com/containers/podman/v4/libpod/lock"
 	"github.com/containers/storage"
 	spec "github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
 // CgroupfsDefaultCgroupParent is the cgroup parent for CgroupFS in libpod
@@ -125,10 +126,6 @@ type Container struct {
 	// This is true if a container is restored from a checkpoint.
 	restoreFromCheckpoint bool
 
-	// Used to query the NOTIFY_SOCKET once along with setting up
-	// mounts etc.
-	notifySocket string
-
 	slirp4netnsSubnet *net.IPNet
 }
 
@@ -155,6 +152,8 @@ type ContainerState struct {
 	ExitCode int32 `json:"exitCode,omitempty"`
 	// Exited is whether the container has exited
 	Exited bool `json:"exited,omitempty"`
+	// Error holds the last known error message during start, stop, or remove
+	Error string `json:"error,omitempty"`
 	// OOMKilled indicates that the container was killed as it ran out of
 	// memory
 	OOMKilled bool `json:"oomKilled,omitempty"`
@@ -172,6 +171,8 @@ type ContainerState struct {
 	// Podman.
 	// These are DEPRECATED and will be removed in a future release.
 	LegacyExecSessions map[string]*legacyExecSession `json:"execSessions,omitempty"`
+	// NetNS is the path or name of the NetNS
+	NetNS string `json:"netns,omitempty"`
 	// NetworkStatusOld contains the configuration results for all networks
 	// the pod is attached to. Only populated if we created a network
 	// namespace for the container, and the network namespace is currently
@@ -203,6 +204,18 @@ type ContainerState struct {
 	// (only by restart policy).
 	RestartCount uint `json:"restartCount,omitempty"`
 
+	// StartupHCPassed indicates that the startup healthcheck has
+	// succeeded and the main healthcheck can begin.
+	StartupHCPassed bool `json:"startupHCPassed,omitempty"`
+	// StartupHCSuccessCount indicates the number of successes of the
+	// startup healthcheck. A startup HC can require more than one success
+	// to be marked as passed.
+	StartupHCSuccessCount int `json:"startupHCSuccessCount,omitempty"`
+	// StartupHCFailureCount indicates the number of failures of the startup
+	// healthcheck. The container will be restarted if this exceed a set
+	// number in the startup HC config.
+	StartupHCFailureCount int `json:"startupHCFailureCount,omitempty"`
+
 	// ExtensionStageHooks holds hooks which will be executed by libpod
 	// and not delegated to the OCI runtime.
 	ExtensionStageHooks map[string][]spec.Hook `json:"extensionStageHooks,omitempty"`
@@ -211,8 +224,13 @@ type ContainerState struct {
 	// network and an interface names
 	NetInterfaceDescriptions ContainerNetworkDescriptions `json:"networkDescriptions,omitempty"`
 
-	// containerPlatformState holds platform-specific container state.
-	containerPlatformState
+	// Service indicates that container is the service container of a
+	// service. A service consists of one or more pods.  The service
+	// container is started before all pods and is stopped when the last
+	// pod stops. The service container allows for tracking and managing
+	// the entire life cycle of service which may be started via
+	// `podman-play-kube`.
+	Service Service
 
 	// Following checkpoint/restore related information is displayed
 	// if the container has been checkpointed or restored.
@@ -234,9 +252,14 @@ type ContainerNamedVolume struct {
 	Dest string `json:"dest"`
 	// Options are fstab style mount options
 	Options []string `json:"options,omitempty"`
+	// IsAnonymous sets the named volume as anonymous even if it has a name
+	// This is used for emptyDir volumes from a kube yaml
+	IsAnonymous bool `json:"setAnonymous,omitempty"`
+	// SubPath determines which part of the Source will be mounted in the container
+	SubPath string
 }
 
-// ContainerOverlayVolume is a overlay volume that will be mounted into the
+// ContainerOverlayVolume is an overlay volume that will be mounted into the
 // container. Each volume is a libpod Volume present in the state.
 type ContainerOverlayVolume struct {
 	// Destination is the absolute path where the mount will be placed in the container.
@@ -281,21 +304,29 @@ type ContainerNetworkDescriptions map[string]int
 // Config accessors
 // Unlocked
 
-// Config returns the configuration used to create the container
+// Config returns the configuration used to create the container.
+// Note that the returned config does not include the actual networks.
+// Use ConfigWithNetworks() if you need them.
 func (c *Container) Config() *ContainerConfig {
 	returnConfig := new(ContainerConfig)
 	if err := JSONDeepCopy(c.config, returnConfig); err != nil {
 		return nil
 	}
+	return returnConfig
+}
 
-	if c != nil {
-		networks, err := c.networks()
-		if err != nil {
-			return nil
-		}
-
-		returnConfig.Networks = networks
+// Config returns the configuration used to create the container.
+func (c *Container) ConfigWithNetworks() *ContainerConfig {
+	returnConfig := c.Config()
+	if returnConfig == nil {
+		return nil
 	}
+
+	networks, err := c.networks()
+	if err != nil {
+		return nil
+	}
+	returnConfig.Networks = networks
 
 	return returnConfig
 }
@@ -337,16 +368,18 @@ func (c *Container) specFromState() (*spec.Spec, error) {
 
 	if f, err := os.Open(c.state.ConfigPath); err == nil {
 		returnSpec = new(spec.Spec)
-		content, err := ioutil.ReadAll(f)
+		content, err := io.ReadAll(f)
 		if err != nil {
-			return nil, errors.Wrapf(err, "error reading container config")
+			return nil, fmt.Errorf("reading container config: %w", err)
 		}
 		if err := json.Unmarshal(content, &returnSpec); err != nil {
-			return nil, errors.Wrapf(err, "error unmarshalling container config")
+			// Malformed spec, just use c.config.Spec instead
+			logrus.Warnf("Error unmarshalling container %s config: %v", c.ID(), err)
+			return c.config.Spec, nil
 		}
 	} else if !os.IsNotExist(err) {
 		// ignore when the file does not exist
-		return nil, errors.Wrapf(err, "error opening container config")
+		return nil, fmt.Errorf("opening container config: %w", err)
 	}
 
 	return returnSpec, nil
@@ -410,6 +443,7 @@ func (c *Container) NamedVolumes() []*ContainerNamedVolume {
 		newVol.Name = vol.Name
 		newVol.Dest = vol.Dest
 		newVol.Options = vol.Options
+		newVol.SubPath = vol.SubPath
 		volumes = append(volumes, newVol)
 	}
 
@@ -502,7 +536,7 @@ func (c *Container) PortMappings() ([]types.PortMapping, error) {
 	if len(c.config.NetNsCtr) > 0 {
 		netNsCtr, err := c.runtime.GetContainer(c.config.NetNsCtr)
 		if err != nil {
-			return nil, errors.Wrapf(err, "unable to lookup network namespace for container %s", c.ID())
+			return nil, fmt.Errorf("unable to look up network namespace for container %s: %w", c.ID(), err)
 		}
 		return netNsCtr.PortMappings()
 	}
@@ -641,7 +675,7 @@ func (c *Container) Hostname() string {
 		utsNsCtr, err := c.runtime.GetContainer(c.config.UTSNsCtr)
 		if err != nil {
 			// should we return an error here?
-			logrus.Errorf("unable to lookup uts namespace for container %s: %v", c.ID(), err)
+			logrus.Errorf("unable to look up uts namespace for container %s: %v", c.ID(), err)
 			return ""
 		}
 		return utsNsCtr.Hostname()
@@ -662,6 +696,22 @@ func (c *Container) WorkingDir() string {
 		return c.config.Spec.Process.Cwd
 	}
 	return "/"
+}
+
+// Terminal returns true if the container has a terminal
+func (c *Container) Terminal() bool {
+	if c.config.Spec != nil && c.config.Spec.Process != nil {
+		return c.config.Spec.Process.Terminal
+	}
+	return false
+}
+
+// LinuxResources return the containers Linux Resources (if any)
+func (c *Container) LinuxResources() *spec.LinuxResources {
+	if c.config.Spec != nil && c.config.Spec.Linux != nil {
+		return c.config.Spec.Linux.Resources
+	}
+	return nil
 }
 
 // State Accessors
@@ -689,7 +739,7 @@ func (c *Container) Mounted() (bool, string, error) {
 		c.lock.Lock()
 		defer c.lock.Unlock()
 		if err := c.syncContainer(); err != nil {
-			return false, "", errors.Wrapf(err, "error updating container %s state", c.ID())
+			return false, "", fmt.Errorf("updating container %s state: %w", c.ID(), err)
 		}
 	}
 	// We cannot directly return c.state.Mountpoint as it is not guaranteed
@@ -719,7 +769,7 @@ func (c *Container) StartedTime() (time.Time, error) {
 		c.lock.Lock()
 		defer c.lock.Unlock()
 		if err := c.syncContainer(); err != nil {
-			return time.Time{}, errors.Wrapf(err, "error updating container %s state", c.ID())
+			return time.Time{}, fmt.Errorf("updating container %s state: %w", c.ID(), err)
 		}
 	}
 	return c.state.StartedTime, nil
@@ -731,7 +781,7 @@ func (c *Container) FinishedTime() (time.Time, error) {
 		c.lock.Lock()
 		defer c.lock.Unlock()
 		if err := c.syncContainer(); err != nil {
-			return time.Time{}, errors.Wrapf(err, "error updating container %s state", c.ID())
+			return time.Time{}, fmt.Errorf("updating container %s state: %w", c.ID(), err)
 		}
 	}
 	return c.state.FinishedTime, nil
@@ -746,7 +796,7 @@ func (c *Container) ExitCode() (int32, bool, error) {
 		c.lock.Lock()
 		defer c.lock.Unlock()
 		if err := c.syncContainer(); err != nil {
-			return 0, false, errors.Wrapf(err, "error updating container %s state", c.ID())
+			return 0, false, fmt.Errorf("updating container %s state: %w", c.ID(), err)
 		}
 	}
 	return c.state.ExitCode, c.state.Exited, nil
@@ -758,7 +808,7 @@ func (c *Container) OOMKilled() (bool, error) {
 		c.lock.Lock()
 		defer c.lock.Unlock()
 		if err := c.syncContainer(); err != nil {
-			return false, errors.Wrapf(err, "error updating container %s state", c.ID())
+			return false, fmt.Errorf("updating container %s state: %w", c.ID(), err)
 		}
 	}
 	return c.state.OOMKilled, nil
@@ -829,7 +879,7 @@ func (c *Container) execSessionNoCopy(id string) (*ExecSession, error) {
 
 	session, ok := c.state.ExecSessions[id]
 	if !ok {
-		return nil, errors.Wrapf(define.ErrNoSuchExecSession, "no exec session with ID %s found in container %s", id, c.ID())
+		return nil, fmt.Errorf("no exec session with ID %s found in container %s: %w", id, c.ID(), define.ErrNoSuchExecSession)
 	}
 
 	return session, nil
@@ -845,7 +895,7 @@ func (c *Container) ExecSession(id string) (*ExecSession, error) {
 
 	returnSession := new(ExecSession)
 	if err := JSONDeepCopy(session, returnSession); err != nil {
-		return nil, errors.Wrapf(err, "error copying contents of container %s exec session %s", c.ID(), session.ID())
+		return nil, fmt.Errorf("copying contents of container %s exec session %s: %w", c.ID(), session.ID(), err)
 	}
 
 	return returnSession, nil
@@ -895,6 +945,20 @@ func (c *Container) StoppedByUser() (bool, error) {
 	return c.state.StoppedByUser, nil
 }
 
+// StartupHCPassed returns whether the container's startup healthcheck passed.
+func (c *Container) StartupHCPassed() (bool, error) {
+	if !c.batched {
+		c.lock.Lock()
+		defer c.lock.Unlock()
+
+		if err := c.syncContainer(); err != nil {
+			return false, err
+		}
+	}
+
+	return c.state.StartupHCPassed, nil
+}
+
 // Misc Accessors
 // Most will require locking
 
@@ -905,7 +969,7 @@ func (c *Container) NamespacePath(linuxNS LinuxNS) (string, error) { //nolint:in
 		c.lock.Lock()
 		defer c.lock.Unlock()
 		if err := c.syncContainer(); err != nil {
-			return "", errors.Wrapf(err, "error updating container %s state", c.ID())
+			return "", fmt.Errorf("updating container %s state: %w", c.ID(), err)
 		}
 	}
 
@@ -916,11 +980,11 @@ func (c *Container) NamespacePath(linuxNS LinuxNS) (string, error) { //nolint:in
 // If the container is not running, an error will be returned
 func (c *Container) namespacePath(linuxNS LinuxNS) (string, error) { //nolint:interfacer
 	if c.state.State != define.ContainerStateRunning && c.state.State != define.ContainerStatePaused {
-		return "", errors.Wrapf(define.ErrCtrStopped, "cannot get namespace path unless container %s is running", c.ID())
+		return "", fmt.Errorf("cannot get namespace path unless container %s is running: %w", c.ID(), define.ErrCtrStopped)
 	}
 
 	if linuxNS == InvalidNS {
-		return "", errors.Wrapf(define.ErrInvalidArg, "invalid namespace requested from container %s", c.ID())
+		return "", fmt.Errorf("invalid namespace requested from container %s: %w", c.ID(), define.ErrInvalidArg)
 	}
 
 	return fmt.Sprintf("/proc/%d/ns/%s", c.state.PID, linuxNS.String()), nil
@@ -943,7 +1007,7 @@ func (c *Container) CgroupPath() (string, error) {
 		c.lock.Lock()
 		defer c.lock.Unlock()
 		if err := c.syncContainer(); err != nil {
-			return "", errors.Wrapf(err, "error updating container %s state", c.ID())
+			return "", fmt.Errorf("updating container %s state: %w", c.ID(), err)
 		}
 	}
 	return c.cGroupPath()
@@ -955,10 +1019,10 @@ func (c *Container) CgroupPath() (string, error) {
 // NOTE: only call this when owning the container's lock.
 func (c *Container) cGroupPath() (string, error) {
 	if c.config.NoCgroups || c.config.CgroupsMode == "disabled" {
-		return "", errors.Wrapf(define.ErrNoCgroups, "this container is not creating cgroups")
+		return "", fmt.Errorf("this container is not creating cgroups: %w", define.ErrNoCgroups)
 	}
 	if c.state.State != define.ContainerStateRunning && c.state.State != define.ContainerStatePaused {
-		return "", errors.Wrapf(define.ErrCtrStopped, "cannot get cgroup path unless container %s is running", c.ID())
+		return "", fmt.Errorf("cannot get cgroup path unless container %s is running: %w", c.ID(), define.ErrCtrStopped)
 	}
 
 	// Read /proc/{PID}/cgroup and find the *longest* cgroup entry.  That's
@@ -974,18 +1038,23 @@ func (c *Container) cGroupPath() (string, error) {
 	// the lookup.
 	// See #10602 for more details.
 	procPath := fmt.Sprintf("/proc/%d/cgroup", c.state.PID)
-	lines, err := ioutil.ReadFile(procPath)
+	lines, err := os.ReadFile(procPath)
 	if err != nil {
 		// If the file doesn't exist, it means the container could have been terminated
-		// so report it.
-		if os.IsNotExist(err) {
-			return "", errors.Wrapf(define.ErrCtrStopped, "cannot get cgroup path unless container %s is running", c.ID())
+		// so report it.  Also check for ESRCH, which means the container could have been
+		// terminated after the file under /proc was opened but before it was read.
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ESRCH) {
+			return "", fmt.Errorf("cannot get cgroup path unless container %s is running: %w", c.ID(), define.ErrCtrStopped)
 		}
 		return "", err
 	}
 
 	var cgroupPath string
 	for _, line := range bytes.Split(lines, []byte("\n")) {
+		// skip last empty line
+		if len(line) == 0 {
+			continue
+		}
 		// cgroups(7) nails it down to three fields with the 3rd
 		// pointing to the cgroup's path which works both on v1 and v2.
 		fields := bytes.Split(line, []byte(":"))
@@ -1004,7 +1073,7 @@ func (c *Container) cGroupPath() (string, error) {
 	}
 
 	if len(cgroupPath) == 0 {
-		return "", errors.Errorf("could not find any cgroup in %q", procPath)
+		return "", fmt.Errorf("could not find any cgroup in %q", procPath)
 	}
 
 	cgroupManager := c.CgroupManager()
@@ -1039,7 +1108,7 @@ func (c *Container) RootFsSize() (int64, error) {
 		c.lock.Lock()
 		defer c.lock.Unlock()
 		if err := c.syncContainer(); err != nil {
-			return -1, errors.Wrapf(err, "error updating container %s state", c.ID())
+			return -1, fmt.Errorf("updating container %s state: %w", c.ID(), err)
 		}
 	}
 	return c.rootFsSize()
@@ -1051,7 +1120,7 @@ func (c *Container) RWSize() (int64, error) {
 		c.lock.Lock()
 		defer c.lock.Unlock()
 		if err := c.syncContainer(); err != nil {
-			return -1, errors.Wrapf(err, "error updating container %s state", c.ID())
+			return -1, fmt.Errorf("updating container %s state: %w", c.ID(), err)
 		}
 	}
 	return c.rwSize()
@@ -1098,7 +1167,7 @@ func (c *Container) IsInitCtr() bool {
 	return len(c.config.InitContainerType) > 0
 }
 
-// IsReadOnly returns whether the container is running in read only mode
+// IsReadOnly returns whether the container is running in read-only mode
 func (c *Container) IsReadOnly() bool {
 	return c.config.Spec.Root.Readonly
 }
@@ -1113,20 +1182,6 @@ func (c *Container) NetworkDisabled() (bool, error) {
 		return container.NetworkDisabled()
 	}
 	return networkDisabled(c)
-}
-
-func networkDisabled(c *Container) (bool, error) {
-	if c.config.CreateNetNS {
-		return false, nil
-	}
-	if !c.config.PostConfigureNetNS {
-		for _, ns := range c.config.Spec.Linux.Namespaces {
-			if ns.Type == spec.NetworkNamespace {
-				return ns.Path == "", nil
-			}
-		}
-	}
-	return false, nil
 }
 
 func (c *Container) HostNetwork() bool {
@@ -1153,7 +1208,7 @@ func (c *Container) ContainerState() (*ContainerState, error) {
 	}
 	returnConfig := new(ContainerState)
 	if err := JSONDeepCopy(c.state, returnConfig); err != nil {
-		return nil, errors.Wrapf(err, "error copying container %s state", c.ID())
+		return nil, fmt.Errorf("copying container %s state: %w", c.ID(), err)
 	}
 	return c.state, nil
 }
@@ -1197,12 +1252,7 @@ func (c *Container) Secrets() []*ContainerSecret {
 // Networks gets all the networks this container is connected to.
 // Please do NOT use ctr.config.Networks, as this can be changed from those
 // values at runtime via network connect and disconnect.
-// If the container is configured to use CNI and this function returns an empty
-// array, the container will still be connected to the default network.
-// The second return parameter, a bool, indicates that the container container
-// is joining the default CNI network - the network name will be included in the
-// returned array of network names, but the container did not explicitly join
-// this network.
+// Returned array of network names or error.
 func (c *Container) Networks() ([]string, error) {
 	if !c.batched {
 		c.lock.Lock()
@@ -1269,10 +1319,7 @@ func (c *Container) NetworkMode() string {
 
 // Unlocked accessor for networks
 func (c *Container) networks() (map[string]types.PerNetworkOptions, error) {
-	if c != nil && c.runtime != nil && c.runtime.state != nil { // can fail if c.networks is called from the tests
-		return c.runtime.state.GetNetworks(c)
-	}
-	return nil, nil
+	return c.runtime.state.GetNetworks(c)
 }
 
 // getInterfaceByName returns a formatted interface name for a given
@@ -1314,9 +1361,57 @@ func (c *Container) getNetworkStatus() map[string]types.StatusBlock {
 		}
 		c.state.NetworkStatus = result
 		_ = c.save()
-		// TODO remove debug for final version
-		logrus.Debugf("converted old network result to new result %v", result)
+
 		return result
 	}
 	return nil
+}
+
+func (c *Container) NamespaceMode(ns spec.LinuxNamespaceType, ctrSpec *spec.Spec) string {
+	switch ns {
+	case spec.UTSNamespace:
+		if c.config.UTSNsCtr != "" {
+			return fmt.Sprintf("container:%s", c.config.UTSNsCtr)
+		}
+	case spec.CgroupNamespace:
+		if c.config.CgroupNsCtr != "" {
+			return fmt.Sprintf("container:%s", c.config.CgroupNsCtr)
+		}
+	case spec.IPCNamespace:
+		if c.config.IPCNsCtr != "" {
+			return fmt.Sprintf("container:%s", c.config.IPCNsCtr)
+		}
+	case spec.PIDNamespace:
+		if c.config.PIDNsCtr != "" {
+			return fmt.Sprintf("container:%s", c.config.PIDNsCtr)
+		}
+	case spec.UserNamespace:
+		if c.config.UserNsCtr != "" {
+			return fmt.Sprintf("container:%s", c.config.UserNsCtr)
+		}
+	case spec.NetworkNamespace:
+		if c.config.NetNsCtr != "" {
+			return fmt.Sprintf("container:%s", c.config.NetNsCtr)
+		}
+	case spec.MountNamespace:
+		if c.config.MountNsCtr != "" {
+			return fmt.Sprintf("container:%s", c.config.MountNsCtr)
+		}
+	}
+
+	if ctrSpec.Linux != nil {
+		// Locate the spec's given namespace.
+		// If there is none, it's namespace=host.
+		// If there is one and it has a path, it's "ns:".
+		// If there is no path, it's default - the empty string.
+		for _, availableNS := range ctrSpec.Linux.Namespaces {
+			if availableNS.Type == ns {
+				if availableNS.Path != "" {
+					return fmt.Sprintf("ns:%s", availableNS.Path)
+				}
+				return "private"
+			}
+		}
+	}
+	return "host"
 }

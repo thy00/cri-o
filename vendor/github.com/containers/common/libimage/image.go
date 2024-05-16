@@ -2,6 +2,7 @@ package libimage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -16,13 +17,23 @@ import (
 	"github.com/hashicorp/go-multierror"
 	"github.com/opencontainers/go-digest"
 	ociv1 "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
 // Image represents an image in the containers storage and allows for further
 // operations and data manipulation.
 type Image struct {
+	// ListData that is being set by (*Runtime).ListImages().  Note that
+	// the data may be outdated.
+	ListData struct {
+		// Dangling indicates if the image is dangling.  Use
+		// `IsDangling()` to compute the latest state.
+		IsDangling *bool
+		// Parent points to the parent image.  Use `Parent()` to
+		// compute the latest state.
+		Parent *Image
+	}
+
 	// Backwards pointer to the runtime.
 	runtime *Runtime
 
@@ -46,6 +57,8 @@ type Image struct {
 		ociv1Image *ociv1.Image
 		// Names() parsed into references.
 		namesReferences []reference.Reference
+		// Calculating the Size() is expensive, so cache it.
+		size *int64
 	}
 }
 
@@ -54,7 +67,7 @@ func (i *Image) reload() error {
 	logrus.Tracef("Reloading image %s", i.ID())
 	img, err := i.runtime.store.Image(i.ID())
 	if err != nil {
-		return errors.Wrap(err, "reloading image")
+		return fmt.Errorf("reloading image: %w", err)
 	}
 	i.storageImage = img
 	i.cached.imageSource = nil
@@ -62,6 +75,7 @@ func (i *Image) reload() error {
 	i.cached.completeInspectData = nil
 	i.cached.ociv1Image = nil
 	i.cached.namesReferences = nil
+	i.cached.size = nil
 	return nil
 }
 
@@ -81,7 +95,7 @@ func (i *Image) isCorrupted(name string) error {
 		if name == "" {
 			name = i.ID()[:12]
 		}
-		return errors.Errorf("Image %s exists in local storage but may be corrupted (remove the image to resolve the issue): %v", name, err)
+		return fmt.Errorf("Image %s exists in local storage but may be corrupted (remove the image to resolve the issue): %v", name, err)
 	}
 	return nil
 }
@@ -195,7 +209,7 @@ func (i *Image) Labels(ctx context.Context) (map[string]string, error) {
 	if err != nil {
 		isManifestList, listErr := i.IsManifestList(ctx)
 		if listErr != nil {
-			err = errors.Wrapf(err, "fallback error checking whether image is a manifest list: %v", err)
+			err = fmt.Errorf("fallback error checking whether image is a manifest list: %v: %w", err, err)
 		} else if isManifestList {
 			logrus.Debugf("Ignoring error: cannot return labels for manifest list or image index %s", i.ID())
 			return nil, nil
@@ -213,10 +227,14 @@ func (i *Image) TopLayer() string {
 
 // Parent returns the parent image or nil if there is none
 func (i *Image) Parent(ctx context.Context) (*Image, error) {
-	tree, err := i.runtime.layerTree()
+	tree, err := i.runtime.layerTree(nil)
 	if err != nil {
 		return nil, err
 	}
+	return i.parent(ctx, tree)
+}
+
+func (i *Image) parent(ctx context.Context, tree *layerTree) (*Image, error) {
 	return tree.parent(ctx, i)
 }
 
@@ -243,7 +261,7 @@ func (i *Image) Children(ctx context.Context) ([]*Image, error) {
 // created for this invocation only.
 func (i *Image) getChildren(ctx context.Context, all bool, tree *layerTree) ([]*Image, error) {
 	if tree == nil {
-		t, err := i.runtime.layerTree()
+		t, err := i.runtime.layerTree(nil)
 		if err != nil {
 			return nil, err
 		}
@@ -305,7 +323,7 @@ func (i *Image) removeContainers(options *RemoveImagesOptions) error {
 	for _, cID := range containers {
 		if err := i.runtime.store.DeleteContainer(cID); err != nil {
 			// If the container does not exist anymore, we're good.
-			if errors.Cause(err) != storage.ErrContainerUnknown {
+			if !errors.Is(err, storage.ErrContainerUnknown) {
 				multiE = multierror.Append(multiE, err)
 			}
 		}
@@ -361,7 +379,7 @@ func (i *Image) removeRecursive(ctx context.Context, rmMap map[string]*RemoveIma
 	logrus.Debugf("Removing image %s", i.ID())
 
 	if i.IsReadOnly() {
-		return processedIDs, errors.Errorf("cannot remove read-only image %q", i.ID())
+		return processedIDs, fmt.Errorf("cannot remove read-only image %q", i.ID())
 	}
 
 	if i.runtime.eventChannel != nil {
@@ -384,15 +402,12 @@ func (i *Image) removeRecursive(ctx context.Context, rmMap map[string]*RemoveIma
 	// have a closer look at the errors.  On top, image removal should be
 	// tolerant toward corrupted images.
 	handleError := func(err error) error {
-		switch errors.Cause(err) {
-		case storage.ErrImageUnknown, storage.ErrNotAnImage, storage.ErrLayerUnknown:
-			// The image or layers of the image may already
-			// have been removed in which case we consider
-			// the image to be removed.
+		if errors.Is(err, storage.ErrImageUnknown) || errors.Is(err, storage.ErrNotAnImage) || errors.Is(err, storage.ErrLayerUnknown) {
+			// The image or layers of the image may already have been removed
+			// in which case we consider the image to be removed.
 			return nil
-		default:
-			return err
 		}
+		return err
 	}
 
 	// Calculate the size if requested.  `podman-image-prune` likes to
@@ -421,11 +436,11 @@ func (i *Image) removeRecursive(ctx context.Context, rmMap map[string]*RemoveIma
 		byDigest := strings.HasPrefix(referencedBy, "sha256:")
 		if !options.Force {
 			if byID && numNames > 1 {
-				return processedIDs, errors.Errorf("unable to delete image %q by ID with more than one tag (%s): please force removal", i.ID(), i.Names())
+				return processedIDs, fmt.Errorf("unable to delete image %q by ID with more than one tag (%s): please force removal", i.ID(), i.Names())
 			} else if byDigest && numNames > 1 {
 				// FIXME - Docker will remove the digest but containers storage
 				// does not support that yet, so our hands are tied.
-				return processedIDs, errors.Errorf("unable to delete image %q by digest with more than one tag (%s): please force removal", i.ID(), i.Names())
+				return processedIDs, fmt.Errorf("unable to delete image %q by digest with more than one tag (%s): please force removal", i.ID(), i.Names())
 			}
 		}
 
@@ -473,12 +488,26 @@ func (i *Image) removeRecursive(ctx context.Context, rmMap map[string]*RemoveIma
 	}
 
 	if _, err := i.runtime.store.DeleteImage(i.ID(), true); handleError(err) != nil {
+		if errors.Is(err, storage.ErrImageUsedByContainer) {
+			err = fmt.Errorf("%w: consider listing external containers and force-removing image", err)
+		}
 		return processedIDs, err
 	}
+
 	report.Untagged = append(report.Untagged, i.Names()...)
+	if i.runtime.eventChannel != nil {
+		for _, name := range i.Names() {
+			i.runtime.writeEvent(&Event{ID: i.ID(), Name: name, Time: time.Now(), Type: EventTypeImageUntag})
+		}
+	}
 
 	if !hasChildren {
 		report.Removed = true
+	}
+
+	// Do not delete any parents if NoPrune is true
+	if options.NoPrune {
+		return processedIDs, nil
 	}
 
 	// Check if can remove the parent image.
@@ -498,7 +527,6 @@ func (i *Image) removeRecursive(ctx context.Context, rmMap map[string]*RemoveIma
 	if !danglingParent {
 		return processedIDs, nil
 	}
-
 	// Recurse into removing the parent.
 	return parent.removeRecursive(ctx, rmMap, processedIDs, "", options)
 }
@@ -509,16 +537,16 @@ var errTagDigest = errors.New("tag by digest not supported")
 // storage.  The name is normalized according to the rules of NormalizeName.
 func (i *Image) Tag(name string) error {
 	if strings.HasPrefix(name, "sha256:") { // ambiguous input
-		return errors.Wrap(errTagDigest, name)
+		return fmt.Errorf("%s: %w", name, errTagDigest)
 	}
 
 	ref, err := NormalizeName(name)
 	if err != nil {
-		return errors.Wrapf(err, "normalizing name %q", name)
+		return fmt.Errorf("normalizing name %q: %w", name, err)
 	}
 
 	if _, isDigested := ref.(reference.Digested); isDigested {
-		return errors.Wrap(errTagDigest, name)
+		return fmt.Errorf("%s: %w", name, errTagDigest)
 	}
 
 	logrus.Debugf("Tagging image %s with %q", i.ID(), ref.String())
@@ -546,12 +574,12 @@ var errUntagDigest = errors.New("untag by digest not supported")
 // of NormalizeName.
 func (i *Image) Untag(name string) error {
 	if strings.HasPrefix(name, "sha256:") { // ambiguous input
-		return errors.Wrap(errUntagDigest, name)
+		return fmt.Errorf("%s: %w", name, errUntagDigest)
 	}
 
 	ref, err := NormalizeName(name)
 	if err != nil {
-		return errors.Wrapf(err, "normalizing name %q", name)
+		return fmt.Errorf("normalizing name %q: %w", name, err)
 	}
 
 	// FIXME: this is breaking Podman CI but must be re-enabled once
@@ -560,9 +588,9 @@ func (i *Image) Untag(name string) error {
 	//
 	// !!! Also make sure to re-enable the tests !!!
 	//
-	//	if _, isDigested := ref.(reference.Digested); isDigested {
-	//		return errors.Wrap(errUntagDigest, name)
-	//	}
+	// if _, isDigested := ref.(reference.Digested); isDigested {
+	// 	return fmt.Errorf("%s: %w", name, errUntagDigest)
+	// }
 
 	name = ref.String()
 
@@ -582,7 +610,7 @@ func (i *Image) Untag(name string) error {
 	}
 
 	if !removedName {
-		return errors.Wrap(errTagUnknown, name)
+		return fmt.Errorf("%s: %w", name, errTagUnknown)
 	}
 
 	if err := i.runtime.store.SetNames(i.ID(), newNames); err != nil {
@@ -608,7 +636,7 @@ func (i *Image) RepoTags() ([]string, error) {
 // NamedTaggedRepoTags returns the repotags associated with the image as a
 // slice of reference.NamedTagged.
 func (i *Image) NamedTaggedRepoTags() ([]reference.NamedTagged, error) {
-	var repoTags []reference.NamedTagged
+	repoTags := make([]reference.NamedTagged, 0, len(i.Names()))
 	for _, name := range i.Names() {
 		parsed, err := reference.Parse(name)
 		if err != nil {
@@ -731,7 +759,7 @@ func (i *Image) Mount(ctx context.Context, mountOptions []string, mountLabel str
 func (i *Image) Mountpoint() (string, error) {
 	mountedTimes, err := i.runtime.store.Mounted(i.TopLayer())
 	if err != nil || mountedTimes == 0 {
-		if errors.Cause(err) == storage.ErrLayerUnknown {
+		if errors.Is(err, storage.ErrLayerUnknown) {
 			// Can happen, Podman did it, but there's no
 			// explanation why.
 			err = nil
@@ -765,7 +793,13 @@ func (i *Image) Unmount(force bool) error {
 
 // Size computes the size of the image layers and associated data.
 func (i *Image) Size() (int64, error) {
-	return i.runtime.store.ImageSize(i.ID())
+	if i.cached.size != nil {
+		return *i.cached.size, nil
+	}
+
+	size, err := i.runtime.store.ImageSize(i.ID())
+	i.cached.size = &size
+	return size, err
 }
 
 // HasDifferentDigestOptions allows for customizing the check if another
@@ -943,7 +977,7 @@ func getImageID(ctx context.Context, src types.ImageReference, sys *types.System
 	}()
 	imageDigest := newImg.ConfigInfo().Digest
 	if err = imageDigest.Validate(); err != nil {
-		return "", errors.Wrapf(err, "getting config info")
+		return "", fmt.Errorf("getting config info: %w", err)
 	}
 	return "@" + imageDigest.Encoded(), nil
 }

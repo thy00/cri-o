@@ -35,7 +35,9 @@ import (
 // The serialization format is:
 //
 // <quantity>        ::= <signedNumber><suffix>
-//   (Note that <suffix> may be empty, from the "" case in <decimalSI>.)
+//
+//	(Note that <suffix> may be empty, from the "" case in <decimalSI>.)
+//
 // <digit>           ::= 0 | 1 | ... | 9
 // <digits>          ::= <digit> | <digit><digits>
 // <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits>
@@ -43,9 +45,13 @@ import (
 // <signedNumber>    ::= <number> | <sign><number>
 // <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI>
 // <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei
-//   (International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)
+//
+//	(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)
+//
 // <decimalSI>       ::= m | "" | k | M | G | T | P | E
-//   (Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)
+//
+//	(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)
+//
 // <decimalExponent> ::= "e" <signedNumber> | "E" <signedNumber>
 //
 // No matter which of the three exponent forms is used, no quantity may represent
@@ -60,14 +66,17 @@ import (
 // Before serializing, Quantity will be put in "canonical form".
 // This means that Exponent/suffix will be adjusted up or down (with a
 // corresponding increase or decrease in Mantissa) such that:
-//   a. No precision is lost
-//   b. No fractional digits will be emitted
-//   c. The exponent (or suffix) is as large as possible.
+//
+//	a. No precision is lost
+//	b. No fractional digits will be emitted
+//	c. The exponent (or suffix) is as large as possible.
+//
 // The sign will be omitted unless the number is negative.
 //
 // Examples:
-//   1.5 will be serialized as "1500m"
-//   1.5Gi will be serialized as "1536Mi"
+//
+//	1.5 will be serialized as "1500m"
+//	1.5Gi will be serialized as "1536Mi"
 //
 // Note that the quantity will NEVER be internally represented by a
 // floating point number. That is the whole point of this exercise.
@@ -138,7 +147,6 @@ const (
 
 var (
 	// Errors that could happen while parsing a string.
-	//nolint:revive
 	ErrFormatWrong = errors.New("quantities must match the regular expression '" + splitREString + "'")
 	ErrNumeric     = errors.New("unable to parse numeric part of quantity")
 	ErrSuffix      = errors.New("unable to parse quantity's suffix")
@@ -258,7 +266,7 @@ Suffix:
 	// we encountered a non decimal in the Suffix loop, but the last character
 	// was not a valid exponent
 	err = ErrFormatWrong
-	// nolint:nakedret
+	//nolint:nakedret
 	return
 }
 
@@ -293,7 +301,7 @@ func ParseQuantity(str string) (Quantity, error) {
 		switch {
 		case exponent >= 0 && len(denom) == 0:
 			// only handle positive binary numbers with the fast path
-			mantissa = int64(int64(mantissa) << uint64(exponent))
+			mantissa <<= uint64(exponent)
 			// 1Mi (2^20) has ~6 digits of decimal precision, so exponent*3/10 -1 is roughly the precision
 			precision = 15 - int32(len(num)) - int32(float32(exponent)*3/10) - 1
 		default:
@@ -313,7 +321,7 @@ func ParseQuantity(str string) (Quantity, error) {
 			if err != nil {
 				return Quantity{}, ErrNumeric
 			}
-			if result, ok := int64Multiply(value, int64(mantissa)); ok {
+			if result, ok := int64Multiply(value, mantissa); ok {
 				if !positive {
 					result = -result
 				}
@@ -392,10 +400,10 @@ func (q Quantity) DeepCopy() Quantity {
 // CanonicalizeBytes returns the canonical form of q and its suffix (see comment on Quantity).
 //
 // Note about BinarySI:
-// * If q.Format is set to BinarySI and q.Amount represents a non-zero value between
-//   -1 and +1, it will be emitted as if q.Format were DecimalSI.
-// * Otherwise, if q.Format is set to BinarySI, fractional parts of q.Amount will be
-//   rounded up. (1.1i becomes 2i.)
+//   - If q.Format is set to BinarySI and q.Amount represents a non-zero value between
+//     -1 and +1, it will be emitted as if q.Format were DecimalSI.
+//   - Otherwise, if q.Format is set to BinarySI, fractional parts of q.Amount will be
+//     rounded up. (1.1i becomes 2i.)
 func (q *Quantity) CanonicalizeBytes(out []byte) (result, suffix []byte) {
 	if q.IsZero() {
 		return zeroBytes, nil
@@ -579,9 +587,9 @@ func (q Quantity) MarshalJSON() ([]byte, error) {
 	// if CanonicalizeBytes needed more space than our slice provided, we may need to allocate again so use
 	// append
 	result = result[:1]
-	result = append(result, number...) // nolint: makezero
-	result = append(result, suffix...) // nolint: makezero
-	result = append(result, '"')       // nolint: makezero
+	result = append(result, number...) //nolint: makezero
+	result = append(result, suffix...) //nolint: makezero
+	result = append(result, '"')       //nolint: makezero
 	return result, nil
 }
 

@@ -2,6 +2,7 @@ package libpod
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -14,7 +15,9 @@ import (
 
 	"github.com/containers/common/libnetwork/types"
 	"github.com/containers/common/pkg/config"
+	cutil "github.com/containers/common/pkg/util"
 	"github.com/containers/podman/v4/libpod/define"
+	"github.com/containers/podman/v4/pkg/annotations"
 	"github.com/containers/podman/v4/pkg/env"
 	v1 "github.com/containers/podman/v4/pkg/k8s.io/api/core/v1"
 	"github.com/containers/podman/v4/pkg/k8s.io/apimachinery/pkg/api/resource"
@@ -25,8 +28,6 @@ import (
 	"github.com/containers/podman/v4/pkg/specgen"
 	"github.com/containers/podman/v4/pkg/util"
 	"github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/opencontainers/runtime-tools/generate"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -42,8 +43,8 @@ func GenerateForKube(ctx context.Context, ctrs []*Container) (*v1.Pod, error) {
 func (p *Pod) GenerateForKube(ctx context.Context) (*v1.Pod, []v1.ServicePort, error) {
 	// Generate the v1.Pod yaml description
 	var (
-		ports        []v1.ContainerPort //nolint
-		servicePorts []v1.ServicePort   //nolint
+		ports        []v1.ContainerPort
+		servicePorts []v1.ServicePort
 	)
 
 	allContainers, err := p.allContainers()
@@ -52,15 +53,16 @@ func (p *Pod) GenerateForKube(ctx context.Context) (*v1.Pod, []v1.ServicePort, e
 	}
 	// If the pod has no containers, no sense to generate YAML
 	if len(allContainers) == 0 {
-		return nil, servicePorts, errors.Errorf("pod %s has no containers", p.ID())
+		return nil, servicePorts, fmt.Errorf("pod %s has no containers", p.ID())
 	}
 	// If only an infra container is present, makes no sense to generate YAML
 	if len(allContainers) == 1 && p.HasInfraContainer() {
-		return nil, servicePorts, errors.Errorf("pod %s only has an infra container", p.ID())
+		return nil, servicePorts, fmt.Errorf("pod %s only has an infra container", p.ID())
 	}
 
 	extraHost := make([]v1.HostAlias, 0)
 	hostNetwork := false
+	hostUsers := true
 	if p.HasInfraContainer() {
 		infraContainer, err := p.getInfraContainer()
 		if err != nil {
@@ -86,8 +88,9 @@ func (p *Pod) GenerateForKube(ctx context.Context) (*v1.Pod, []v1.ServicePort, e
 			return nil, servicePorts, err
 		}
 		hostNetwork = infraContainer.NetworkMode() == string(namespaces.NetworkMode(specgen.Host))
+		hostUsers = infraContainer.IDMappings().HostUIDMapping && infraContainer.IDMappings().HostGIDMapping
 	}
-	pod, err := p.podWithContainers(ctx, allContainers, ports, hostNetwork)
+	pod, err := p.podWithContainers(ctx, allContainers, ports, hostNetwork, hostUsers)
 	if err != nil {
 		return nil, servicePorts, err
 	}
@@ -266,6 +269,8 @@ func GenerateKubeServiceFromV1Pod(pod *v1.Pod, servicePorts []v1.ServicePort) (Y
 	}
 	service.Spec = serviceSpec
 	service.ObjectMeta = pod.ObjectMeta
+	// Reset the annotations for the service as the pod annotations are not needed for the service
+	service.ObjectMeta.Annotations = nil
 	tm := v12.TypeMeta{
 		Kind:       "Service",
 		APIVersion: pod.TypeMeta.APIVersion,
@@ -345,13 +350,14 @@ func containersToServicePorts(containers []v1.Container) ([]v1.ServicePort, erro
 	return sps, nil
 }
 
-func (p *Pod) podWithContainers(ctx context.Context, containers []*Container, ports []v1.ContainerPort, hostNetwork bool) (*v1.Pod, error) {
+func (p *Pod) podWithContainers(ctx context.Context, containers []*Container, ports []v1.ContainerPort, hostNetwork, hostUsers bool) (*v1.Pod, error) {
 	deDupPodVolumes := make(map[string]*v1.Volume)
 	first := true
 	podContainers := make([]v1.Container, 0, len(containers))
 	podInitCtrs := []v1.Container{}
 	podAnnotations := make(map[string]string)
 	dnsInfo := v1.PodDNSConfig{}
+	var hostname string
 
 	// Let's sort the containers in order of created time
 	// This will ensure that the init containers are defined in the correct order in the kube yaml
@@ -360,6 +366,9 @@ func (p *Pod) podWithContainers(ctx context.Context, containers []*Container, po
 	for _, ctr := range containers {
 		if !ctr.IsInfra() {
 			for k, v := range ctr.config.Spec.Annotations {
+				if define.IsReservedAnnotation(k) || annotations.IsReservedAnnotation(k) {
+					continue
+				}
 				podAnnotations[fmt.Sprintf("%s/%s", k, removeUnderscores(ctr.Name()))] = TruncateKubeAnnotation(v)
 			}
 			// Convert auto-update labels into kube annotations
@@ -367,26 +376,38 @@ func (p *Pod) podWithContainers(ctx context.Context, containers []*Container, po
 				podAnnotations[k] = TruncateKubeAnnotation(v)
 			}
 			isInit := ctr.IsInitCtr()
+			// Since hostname is only set at pod level, set the hostname to the hostname of the first container we encounter
+			if hostname == "" {
+				// Only set the hostname if it is not set to the truncated container ID, which we do by default if no
+				// hostname is specified for the container
+				if !strings.Contains(ctr.ID(), ctr.Hostname()) {
+					hostname = ctr.Hostname()
+				}
+			}
 
 			ctr, volumes, _, annotations, err := containerToV1Container(ctx, ctr)
 			if err != nil {
 				return nil, err
 			}
 			for k, v := range annotations {
-				podAnnotations[define.BindMountPrefix+k] = TruncateKubeAnnotation(v)
+				podAnnotations[define.BindMountPrefix] = TruncateKubeAnnotation(k + ":" + v)
 			}
 			// Since port bindings for the pod are handled by the
-			// infra container, wipe them here.
-			ctr.Ports = nil
+			// infra container, wipe them here only if we are sharing the net namespace
+			// If the network namespace is not being shared in the pod, then containers
+			// can have their own network configurations
+			if p.SharesNet() {
+				ctr.Ports = nil
 
-			// We add the original port declarations from the libpod infra container
-			// to the first kubernetes container description because otherwise we loose
-			// the original container/port bindings.
-			// Add the port configuration to the first regular container or the first
-			// init container if only init containers have been created in the pod.
-			if first && len(ports) > 0 && (!isInit || len(containers) == 2) {
-				ctr.Ports = ports
-				first = false
+				// We add the original port declarations from the libpod infra container
+				// to the first kubernetes container description because otherwise we loose
+				// the original container/port bindings.
+				// Add the port configuration to the first regular container or the first
+				// init container if only init containers have been created in the pod.
+				if first && len(ports) > 0 && (!isInit || len(containers) == 2) {
+					ctr.Ports = ports
+					first = false
+				}
 			}
 			if isInit {
 				podInitCtrs = append(podInitCtrs, ctr)
@@ -417,7 +438,7 @@ func (p *Pod) podWithContainers(ctx context.Context, containers []*Container, po
 			}
 		}
 	}
-	podVolumes := make([]v1.Volume, 0, len(deDupPodVolumes))
+	podVolumes := []v1.Volume{}
 	for _, vol := range deDupPodVolumes {
 		podVolumes = append(podVolumes, *vol)
 	}
@@ -429,10 +450,12 @@ func (p *Pod) podWithContainers(ctx context.Context, containers []*Container, po
 		podContainers,
 		podVolumes,
 		&dnsInfo,
-		hostNetwork), nil
+		hostNetwork,
+		hostUsers,
+		hostname), nil
 }
 
-func newPodObject(podName string, annotations map[string]string, initCtrs, containers []v1.Container, volumes []v1.Volume, dnsOptions *v1.PodDNSConfig, hostNetwork bool) *v1.Pod {
+func newPodObject(podName string, annotations map[string]string, initCtrs, containers []v1.Container, volumes []v1.Volume, dnsOptions *v1.PodDNSConfig, hostNetwork, hostUsers bool, hostname string) *v1.Pod {
 	tm := v12.TypeMeta{
 		Kind:       "Pod",
 		APIVersion: "v1",
@@ -453,9 +476,13 @@ func newPodObject(podName string, annotations map[string]string, initCtrs, conta
 	}
 	ps := v1.PodSpec{
 		Containers:     containers,
+		Hostname:       hostname,
 		HostNetwork:    hostNetwork,
 		InitContainers: initCtrs,
 		Volumes:        volumes,
+	}
+	if !hostUsers {
+		ps.HostUsers = &hostUsers
 	}
 	if dnsOptions != nil && (len(dnsOptions.Nameservers)+len(dnsOptions.Searches)+len(dnsOptions.Options) > 0) {
 		ps.DNSConfig = dnsOptions
@@ -474,13 +501,18 @@ func simplePodWithV1Containers(ctx context.Context, ctrs []*Container) (*v1.Pod,
 	kubeCtrs := make([]v1.Container, 0, len(ctrs))
 	kubeInitCtrs := []v1.Container{}
 	kubeVolumes := make([]v1.Volume, 0)
+	hostUsers := true
 	hostNetwork := true
 	podDNS := v1.PodDNSConfig{}
 	kubeAnnotations := make(map[string]string)
 	ctrNames := make([]string, 0, len(ctrs))
+	var hostname string
 	for _, ctr := range ctrs {
 		ctrNames = append(ctrNames, removeUnderscores(ctr.Name()))
 		for k, v := range ctr.config.Spec.Annotations {
+			if define.IsReservedAnnotation(k) || annotations.IsReservedAnnotation(k) {
+				continue
+			}
 			kubeAnnotations[fmt.Sprintf("%s/%s", k, removeUnderscores(ctr.Name()))] = TruncateKubeAnnotation(v)
 		}
 
@@ -490,16 +522,27 @@ func simplePodWithV1Containers(ctx context.Context, ctrs []*Container) (*v1.Pod,
 		}
 
 		isInit := ctr.IsInitCtr()
+		// Since hostname is only set at pod level, set the hostname to the hostname of the first container we encounter
+		if hostname == "" {
+			// Only set the hostname if it is not set to the truncated container ID, which we do by default if no
+			// hostname is specified for the container
+			if !strings.Contains(ctr.ID(), ctr.Hostname()) {
+				hostname = ctr.Hostname()
+			}
+		}
 
 		if !ctr.HostNetwork() {
 			hostNetwork = false
+		}
+		if !(ctr.IDMappings().HostUIDMapping && ctr.IDMappings().HostGIDMapping) {
+			hostUsers = false
 		}
 		kubeCtr, kubeVols, ctrDNS, annotations, err := containerToV1Container(ctx, ctr)
 		if err != nil {
 			return nil, err
 		}
 		for k, v := range annotations {
-			kubeAnnotations[define.BindMountPrefix+k] = TruncateKubeAnnotation(v)
+			kubeAnnotations[define.BindMountPrefix] = TruncateKubeAnnotation(k + ":" + v)
 		}
 		if isInit {
 			kubeInitCtrs = append(kubeInitCtrs, kubeCtr)
@@ -515,7 +558,7 @@ func simplePodWithV1Containers(ctx context.Context, ctrs []*Container) (*v1.Pod,
 					podDNS.Nameservers = make([]string, 0)
 				}
 				for _, s := range servers {
-					if !util.StringInSlice(s, podDNS.Nameservers) { // only append if it does not exist
+					if !cutil.StringInSlice(s, podDNS.Nameservers) { // only append if it does not exist
 						podDNS.Nameservers = append(podDNS.Nameservers, s)
 					}
 				}
@@ -526,7 +569,7 @@ func simplePodWithV1Containers(ctx context.Context, ctrs []*Container) (*v1.Pod,
 					podDNS.Searches = make([]string, 0)
 				}
 				for _, d := range domains {
-					if !util.StringInSlice(d, podDNS.Searches) { // only append if it does not exist
+					if !cutil.StringInSlice(d, podDNS.Searches) { // only append if it does not exist
 						podDNS.Searches = append(podDNS.Searches, d)
 					}
 				}
@@ -543,7 +586,7 @@ func simplePodWithV1Containers(ctx context.Context, ctrs []*Container) (*v1.Pod,
 	podName := removeUnderscores(ctrs[0].Name())
 	// Check if the pod name and container name will end up conflicting
 	// Append -pod if so
-	if util.StringInSlice(podName, ctrNames) {
+	if cutil.StringInSlice(podName, ctrNames) {
 		podName += "-pod"
 	}
 
@@ -554,7 +597,9 @@ func simplePodWithV1Containers(ctx context.Context, ctrs []*Container) (*v1.Pod,
 		kubeCtrs,
 		kubeVolumes,
 		&podDNS,
-		hostNetwork), nil
+		hostNetwork,
+		hostUsers,
+		hostname), nil
 }
 
 // containerToV1Container converts information we know about a libpod container
@@ -563,7 +608,7 @@ func containerToV1Container(ctx context.Context, c *Container) (v1.Container, []
 	kubeContainer := v1.Container{}
 	kubeVolumes := []v1.Volume{}
 	annotations := make(map[string]string)
-	kubeSec, err := generateKubeSecurityContext(c)
+	kubeSec, hasSecData, err := generateKubeSecurityContext(c)
 	if err != nil {
 		return kubeContainer, kubeVolumes, nil, annotations, err
 	}
@@ -572,7 +617,7 @@ func containerToV1Container(ctx context.Context, c *Container) (v1.Container, []
 	if !c.Privileged() && len(c.config.Spec.Linux.Devices) > 0 {
 		// TODO Enable when we can support devices and their names
 		kubeContainer.VolumeDevices = generateKubeVolumeDeviceFromLinuxDevice(c.config.Spec.Linux.Devices)
-		return kubeContainer, kubeVolumes, nil, annotations, errors.Wrapf(define.ErrNotImplemented, "linux devices")
+		return kubeContainer, kubeVolumes, nil, annotations, fmt.Errorf("linux devices: %w", define.ErrNotImplemented)
 	}
 
 	if len(c.config.UserVolumes) > 0 {
@@ -638,8 +683,15 @@ func containerToV1Container(ctx context.Context, c *Container) (v1.Container, []
 		kubeContainer.WorkingDir = c.WorkingDir()
 	}
 
-	if imgData.User == c.User() {
+	if imgData.User == c.User() && hasSecData {
 		kubeSec.RunAsGroup, kubeSec.RunAsUser = nil, nil
+	}
+	// If the image has user set as a positive integer value, then set runAsNonRoot to true
+	// in the kube yaml
+	imgUserID, err := strconv.Atoi(imgData.User)
+	if err == nil && imgUserID > 0 {
+		trueBool := true
+		kubeSec.RunAsNonRoot = &trueBool
 	}
 
 	envVariables, err := libpodEnvVarsToKubeEnvVars(c.config.Spec.Process.Env, imgData.Config.Env)
@@ -651,14 +703,16 @@ func containerToV1Container(ctx context.Context, c *Container) (v1.Container, []
 	kubeContainer.Ports = ports
 	// This should not be applicable
 	// container.EnvFromSource =
-	kubeContainer.SecurityContext = kubeSec
+	if hasSecData {
+		kubeContainer.SecurityContext = kubeSec
+	}
 	kubeContainer.StdinOnce = false
-	kubeContainer.TTY = c.config.Spec.Process.Terminal
+	kubeContainer.TTY = c.Terminal()
 
-	if c.config.Spec.Linux != nil &&
-		c.config.Spec.Linux.Resources != nil {
-		if c.config.Spec.Linux.Resources.Memory != nil &&
-			c.config.Spec.Linux.Resources.Memory.Limit != nil {
+	resources := c.LinuxResources()
+	if resources != nil {
+		if resources.Memory != nil &&
+			resources.Memory.Limit != nil {
 			if kubeContainer.Resources.Limits == nil {
 				kubeContainer.Resources.Limits = v1.ResourceList{}
 			}
@@ -668,11 +722,11 @@ func containerToV1Container(ctx context.Context, c *Container) (v1.Container, []
 			kubeContainer.Resources.Limits[v1.ResourceMemory] = *qty
 		}
 
-		if c.config.Spec.Linux.Resources.CPU != nil &&
-			c.config.Spec.Linux.Resources.CPU.Quota != nil &&
-			c.config.Spec.Linux.Resources.CPU.Period != nil {
-			quota := *c.config.Spec.Linux.Resources.CPU.Quota
-			period := *c.config.Spec.Linux.Resources.CPU.Period
+		if resources.CPU != nil &&
+			resources.CPU.Quota != nil &&
+			resources.CPU.Period != nil {
+			quota := *resources.CPU.Quota
+			period := *resources.CPU.Period
 
 			if quota > 0 && period > 0 {
 				cpuLimitMilli := int64(1000 * util.PeriodAndQuotaToCores(period, quota))
@@ -742,7 +796,7 @@ func portMappingToContainerPort(portMappings []types.PortMapping) ([]v1.Containe
 			case "SCTP":
 				protocol = v1.ProtocolSCTP
 			default:
-				return containerPorts, errors.Errorf("unknown network protocol %s", p.Protocol)
+				return containerPorts, fmt.Errorf("unknown network protocol %s", p.Protocol)
 			}
 			for i := uint16(0); i < p.Range; i++ {
 				cp := v1.ContainerPort{
@@ -771,7 +825,7 @@ func libpodEnvVarsToKubeEnvVars(envs []string, imageEnvs []string) ([]v1.EnvVar,
 	for _, e := range envs {
 		split := strings.SplitN(e, "=", 2)
 		if len(split) != 2 {
-			return envVars, errors.Errorf("environment variable %s is malformed; should be key=value", e)
+			return envVars, fmt.Errorf("environment variable %s is malformed; should be key=value", e)
 		}
 		if defaultEnv[split[0]] == split[1] {
 			continue
@@ -824,7 +878,7 @@ func libpodMountsToKubeVolumeMounts(c *Container) ([]v1.VolumeMount, []v1.Volume
 
 // generateKubePersistentVolumeClaim converts a ContainerNamedVolume to a Kubernetes PersistentVolumeClaim
 func generateKubePersistentVolumeClaim(v *ContainerNamedVolume) (v1.VolumeMount, v1.Volume) {
-	ro := util.StringInSlice("ro", v.Options)
+	ro := cutil.StringInSlice("ro", v.Options)
 
 	// To avoid naming conflicts with any host path mounts, add a unique suffix to the volume's name.
 	name := v.Name + "-pvc"
@@ -849,34 +903,45 @@ func generateKubeVolumeMount(m specs.Mount) (v1.VolumeMount, v1.Volume, error) {
 	vm := v1.VolumeMount{}
 	vo := v1.Volume{}
 
-	name, err := convertVolumePathToName(m.Source)
-	if err != nil {
-		return vm, vo, err
+	var (
+		name string
+		err  error
+	)
+	if m.Type == define.TypeTmpfs {
+		name = "tmp"
+		vo.EmptyDir = &v1.EmptyDirVolumeSource{
+			Medium: v1.StorageMediumMemory,
+		}
+		vo.Name = name
+	} else {
+		name, err = convertVolumePathToName(m.Source)
+		if err != nil {
+			return vm, vo, err
+		}
+		// To avoid naming conflicts with any persistent volume mounts, add a unique suffix to the volume's name.
+		name += "-host"
+		vo.Name = name
+		vo.HostPath = &v1.HostPathVolumeSource{}
+		vo.HostPath.Path = m.Source
+		isDir, err := isHostPathDirectory(m.Source)
+		// neither a directory or a file lives here, default to creating a directory
+		// TODO should this be an error instead?
+		var hostPathType v1.HostPathType
+		switch {
+		case err != nil:
+			hostPathType = v1.HostPathDirectoryOrCreate
+		case isDir:
+			hostPathType = v1.HostPathDirectory
+		default:
+			hostPathType = v1.HostPathFile
+		}
+		vo.HostPath.Type = &hostPathType
 	}
-	// To avoid naming conflicts with any persistent volume mounts, add a unique suffix to the volume's name.
-	name += "-host"
 	vm.Name = name
 	vm.MountPath = m.Destination
-	if util.StringInSlice("ro", m.Options) {
+	if cutil.StringInSlice("ro", m.Options) {
 		vm.ReadOnly = true
 	}
-
-	vo.Name = name
-	vo.HostPath = &v1.HostPathVolumeSource{}
-	vo.HostPath.Path = m.Source
-	isDir, err := isHostPathDirectory(m.Source)
-	// neither a directory or a file lives here, default to creating a directory
-	// TODO should this be an error instead?
-	var hostPathType v1.HostPathType
-	switch {
-	case err != nil:
-		hostPathType = v1.HostPathDirectoryOrCreate
-	case isDir:
-		hostPathType = v1.HostPathDirectory
-	default:
-		hostPathType = v1.HostPathFile
-	}
-	vo.HostPath.Type = &hostPathType
 
 	return vm, vo, nil
 }
@@ -891,11 +956,11 @@ func isHostPathDirectory(hostPathSource string) (bool, error) {
 
 func convertVolumePathToName(hostSourcePath string) (string, error) {
 	if len(hostSourcePath) == 0 {
-		return "", errors.Errorf("hostSourcePath must be specified to generate volume name")
+		return "", errors.New("hostSourcePath must be specified to generate volume name")
 	}
 	if len(hostSourcePath) == 1 {
 		if hostSourcePath != "/" {
-			return "", errors.Errorf("hostSourcePath malformatted: %s", hostSourcePath)
+			return "", fmt.Errorf("hostSourcePath malformatted: %s", hostSourcePath)
 		}
 		// add special case name
 		return "root", nil
@@ -915,7 +980,7 @@ func determineCapAddDropFromCapabilities(defaultCaps, containerCaps []string) *v
 	// Find caps in the defaultCaps but not in the container's
 	// those indicate a dropped cap
 	for _, capability := range defaultCaps {
-		if !util.StringInSlice(capability, containerCaps) {
+		if !cutil.StringInSlice(capability, containerCaps) {
 			if _, ok := dedupDrop[capability]; !ok {
 				drop = append(drop, v1.Capability(capability))
 				dedupDrop[capability] = true
@@ -925,7 +990,7 @@ func determineCapAddDropFromCapabilities(defaultCaps, containerCaps []string) *v
 	// Find caps in the container but not in the defaults; those indicate
 	// an added cap
 	for _, capability := range containerCaps {
-		if !util.StringInSlice(capability, defaultCaps) {
+		if !cutil.StringInSlice(capability, defaultCaps) {
 			if _, ok := dedupAdd[capability]; !ok {
 				add = append(add, v1.Capability(capability))
 				dedupAdd[capability] = true
@@ -933,27 +998,16 @@ func determineCapAddDropFromCapabilities(defaultCaps, containerCaps []string) *v
 		}
 	}
 
-	return &v1.Capabilities{
-		Add:  add,
-		Drop: drop,
+	if len(add) > 0 || len(drop) > 0 {
+		return &v1.Capabilities{
+			Add:  add,
+			Drop: drop,
+		}
 	}
+	return nil
 }
 
-func capAddDrop(caps *specs.LinuxCapabilities) (*v1.Capabilities, error) {
-	g, err := generate.New("linux")
-	if err != nil {
-		return nil, err
-	}
-
-	defCaps := g.Config.Process.Capabilities
-	// Combine all the default capabilities into a slice
-	defaultCaps := make([]string, 0, len(defCaps.Ambient)+len(defCaps.Bounding)+len(defCaps.Effective)+len(defCaps.Inheritable)+len(defCaps.Permitted))
-	defaultCaps = append(defaultCaps, defCaps.Ambient...)
-	defaultCaps = append(defaultCaps, defCaps.Bounding...)
-	defaultCaps = append(defaultCaps, defCaps.Effective...)
-	defaultCaps = append(defaultCaps, defCaps.Inheritable...)
-	defaultCaps = append(defaultCaps, defCaps.Permitted...)
-
+func (c *Container) capAddDrop(caps *specs.LinuxCapabilities) *v1.Capabilities {
 	// Combine all the container's capabilities into a slice
 	containerCaps := make([]string, 0, len(caps.Ambient)+len(caps.Bounding)+len(caps.Effective)+len(caps.Inheritable)+len(caps.Permitted))
 	containerCaps = append(containerCaps, caps.Ambient...)
@@ -962,12 +1016,12 @@ func capAddDrop(caps *specs.LinuxCapabilities) (*v1.Capabilities, error) {
 	containerCaps = append(containerCaps, caps.Inheritable...)
 	containerCaps = append(containerCaps, caps.Permitted...)
 
-	calculatedCaps := determineCapAddDropFromCapabilities(defaultCaps, containerCaps)
-	return calculatedCaps, nil
+	calculatedCaps := determineCapAddDropFromCapabilities(c.runtime.config.Containers.DefaultCapabilities, containerCaps)
+	return calculatedCaps
 }
 
 // generateKubeSecurityContext generates a securityContext based on the existing container
-func generateKubeSecurityContext(c *Container) (*v1.SecurityContext, error) {
+func generateKubeSecurityContext(c *Container) (*v1.SecurityContext, bool, error) {
 	privileged := c.Privileged()
 	ro := c.IsReadOnly()
 	allowPrivEscalation := !c.config.Spec.Process.NoNewPrivileges
@@ -975,19 +1029,17 @@ func generateKubeSecurityContext(c *Container) (*v1.SecurityContext, error) {
 	var capabilities *v1.Capabilities
 	if !privileged {
 		// Running privileged adds all caps.
-		newCaps, err := capAddDrop(c.config.Spec.Process.Capabilities)
-		if err != nil {
-			return nil, err
-		}
-		capabilities = newCaps
+		capabilities = c.capAddDrop(c.config.Spec.Process.Capabilities)
 	}
 
+	scHasData := false
 	sc := v1.SecurityContext{
 		// RunAsNonRoot is an optional parameter; our first implementations should be root only; however
 		// I'm leaving this as a bread-crumb for later
 		//RunAsNonRoot:             &nonRoot,
 	}
 	if capabilities != nil {
+		scHasData = true
 		sc.Capabilities = capabilities
 	}
 	var selinuxOpts v1.SELinuxOptions
@@ -998,24 +1050,30 @@ func generateKubeSecurityContext(c *Container) (*v1.SecurityContext, error) {
 		case "type":
 			selinuxOpts.Type = opts[1]
 			sc.SELinuxOptions = &selinuxOpts
+			scHasData = true
 		case "level":
 			selinuxOpts.Level = opts[1]
 			sc.SELinuxOptions = &selinuxOpts
+			scHasData = true
 		}
 	case 1:
 		if opts[0] == "disable" {
 			selinuxOpts.Type = "spc_t"
 			sc.SELinuxOptions = &selinuxOpts
+			scHasData = true
 		}
 	}
 
 	if !allowPrivEscalation {
+		scHasData = true
 		sc.AllowPrivilegeEscalation = &allowPrivEscalation
 	}
 	if privileged {
+		scHasData = true
 		sc.Privileged = &privileged
 	}
 	if ro {
+		scHasData = true
 		sc.ReadOnlyRootFilesystem = &ro
 	}
 	if c.User() != "" {
@@ -1024,7 +1082,7 @@ func generateKubeSecurityContext(c *Container) (*v1.SecurityContext, error) {
 			defer c.lock.Unlock()
 		}
 		if err := c.syncContainer(); err != nil {
-			return nil, errors.Wrapf(err, "unable to sync container during YAML generation")
+			return nil, false, fmt.Errorf("unable to sync container during YAML generation: %w", err)
 		}
 
 		mountpoint := c.state.Mountpoint
@@ -1032,7 +1090,7 @@ func generateKubeSecurityContext(c *Container) (*v1.SecurityContext, error) {
 			var err error
 			mountpoint, err = c.mount()
 			if err != nil {
-				return nil, errors.Wrapf(err, "failed to mount %s mountpoint", c.ID())
+				return nil, false, fmt.Errorf("failed to mount %s mountpoint: %w", c.ID(), err)
 			}
 			defer func() {
 				if err := c.unmount(false); err != nil {
@@ -1044,14 +1102,16 @@ func generateKubeSecurityContext(c *Container) (*v1.SecurityContext, error) {
 
 		execUser, err := lookup.GetUserGroupInfo(mountpoint, c.User(), nil)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		uid := int64(execUser.Uid)
 		gid := int64(execUser.Gid)
+		scHasData = true
 		sc.RunAsUser = &uid
 		sc.RunAsGroup = &gid
 	}
-	return &sc, nil
+
+	return &sc, scHasData, nil
 }
 
 // generateKubeVolumeDeviceFromLinuxDevice takes a list of devices and makes a VolumeDevice struct for kube

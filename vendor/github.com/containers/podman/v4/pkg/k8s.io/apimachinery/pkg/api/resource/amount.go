@@ -48,7 +48,7 @@ const (
 var (
 	Zero = int64Amount{}
 
-	// Used by quantity strings - treat as read only
+	// Used by quantity strings - treat as read-only
 	zeroBytes = []byte("0")
 )
 
@@ -221,7 +221,7 @@ func (a int64Amount) AsCanonicalBytes(out []byte) (result []byte, exponent int32
 	exponent = int32(a.scale)
 
 	amount, times := removeInt64Factors(mantissa, 10)
-	exponent += int32(times)
+	exponent += times
 
 	// make sure exponent is a multiple of 3
 	var ok bool

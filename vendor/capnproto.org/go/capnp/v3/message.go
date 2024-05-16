@@ -8,7 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"capnproto.org/go/capnp/v3/internal/packed"
+	"capnproto.org/go/capnp/v3/packed"
 )
 
 // Security limits. Matches C++ implementation.
@@ -41,7 +41,7 @@ type Message struct {
 	//
 	// See https://capnproto.org/encoding.html#capabilities-interfaces for
 	// more details on the capability table.
-	CapTable []*Client
+	CapTable []Client
 
 	// TraverseLimit limits how many total bytes of data are allowed to be
 	// traversed while reading.  Traversal is counted when a Struct or
@@ -110,7 +110,7 @@ func NewSingleSegmentMessage(b []byte) (msg *Message, first *Segment) {
 	return msg, first
 }
 
-// Analagous to NewSingleSegmentMessage, but using MutliSegment.
+// Analogous to NewSingleSegmentMessage, but using MutliSegment.
 func NewMultiSegmentMessage(b [][]byte) (msg *Message, first *Segment) {
 	msg, first, err := NewMessage(MultiSegment(b))
 	if err != nil {
@@ -204,7 +204,7 @@ func (m *Message) SetRoot(p Ptr) error {
 // AddCap appends a capability to the message's capability table and
 // returns its ID.  It "steals" c's reference: the Message will release
 // the client when calling Reset.
-func (m *Message) AddCap(c *Client) CapabilityID {
+func (m *Message) AddCap(c Client) CapabilityID {
 	n := CapabilityID(len(m.CapTable))
 	m.CapTable = append(m.CapTable, c)
 	return n
@@ -355,6 +355,23 @@ func alloc(s *Segment, sz Size) (*Segment, address, error) {
 	return s, addr, nil
 }
 
+func (m *Message) WriteTo(w io.Writer) (int64, error) {
+	wc := &writeCounter{Writer: w}
+	err := NewEncoder(wc).Encode(m)
+	return wc.N, err
+}
+
+type writeCounter struct {
+	N int64
+	io.Writer
+}
+
+func (wc *writeCounter) Write(b []byte) (n int, err error) {
+	n, err = wc.Writer.Write(b)
+	wc.N += int64(n)
+	return
+}
+
 // An Arena loads and allocates segments for a Message.
 type Arena interface {
 	// NumSegments returns the number of segments in the arena.
@@ -384,30 +401,31 @@ type Arena interface {
 	Allocate(minsz Size, segs map[SegmentID]*Segment) (SegmentID, []byte, error)
 }
 
-type singleSegmentArena []byte
+// SingleSegmentArena is an Arena implementation that stores message data
+// in a continguous slice.  Allocation is performed by first allocating a
+// new slice and copying existing data. SingleSegment arena does not fail
+// unless the caller attempts to access another segment.
+type SingleSegmentArena []byte
 
-// SingleSegment returns a new arena with an expanding single-segment
-// buffer.  b can be used to populate the segment for reading or to
-// reserve memory of a specific size.  A SingleSegment arena does not
-// return errors unless you attempt to access another segment.
-func SingleSegment(b []byte) Arena {
-	ssa := new(singleSegmentArena)
-	*ssa = b
-	return ssa
+// SingleSegment constructs a SingleSegmentArena from b.  b MAY be nil.
+// Callers MAY use b to populate the segment for reading, or to reserve
+// memory of a specific size.
+func SingleSegment(b []byte) *SingleSegmentArena {
+	return (*SingleSegmentArena)(&b)
 }
 
-func (ssa *singleSegmentArena) NumSegments() int64 {
+func (ssa SingleSegmentArena) NumSegments() int64 {
 	return 1
 }
 
-func (ssa *singleSegmentArena) Data(id SegmentID) ([]byte, error) {
+func (ssa SingleSegmentArena) Data(id SegmentID) ([]byte, error) {
 	if id != 0 {
 		return nil, errorf("segment %d requested in single segment arena", id)
 	}
-	return *ssa, nil
+	return ssa, nil
 }
 
-func (ssa *singleSegmentArena) Allocate(sz Size, segs map[SegmentID]*Segment) (SegmentID, []byte, error) {
+func (ssa *SingleSegmentArena) Allocate(sz Size, segs map[SegmentID]*Segment) (SegmentID, []byte, error) {
 	data := []byte(*ssa)
 	if segs[0] != nil {
 		data = segs[0].data
@@ -428,8 +446,8 @@ func (ssa *singleSegmentArena) Allocate(sz Size, segs map[SegmentID]*Segment) (S
 	return 0, *ssa, nil
 }
 
-func (ssa *singleSegmentArena) String() string {
-	return fmt.Sprintf("single-segment arena [len=%d cap=%d]", len(*ssa), cap(*ssa))
+func (ssa SingleSegmentArena) String() string {
+	return fmt.Sprintf("single-segment arena [len=%d cap=%d]", len(ssa), cap(ssa))
 }
 
 type roSingleSegment []byte
@@ -453,15 +471,16 @@ func (ss roSingleSegment) String() string {
 	return fmt.Sprintf("read-only single-segment arena [len=%d]", len(ss))
 }
 
-type multiSegmentArena [][]byte
+// MultiSegment is an arena that stores object data across multiple []byte
+// buffers, allocating new buffers of exponentially-increasing size when
+// full. This avoids the potentially-expensive slice copying of SingleSegment.
+type MultiSegmentArena [][]byte
 
 // MultiSegment returns a new arena that allocates new segments when
-// they are full.  b can be used to populate the buffer for reading or
-// to reserve memory of a specific size.
-func MultiSegment(b [][]byte) Arena {
-	msa := new(multiSegmentArena)
-	*msa = b
-	return msa
+// they are full.  b MAY be nil.  Callers MAY use b to populate the
+// buffer for reading or to reserve memory of a specific size.
+func MultiSegment(b [][]byte) *MultiSegmentArena {
+	return (*MultiSegmentArena)(&b)
 }
 
 // demuxArena slices b into a multi-segment arena.  It assumes that
@@ -482,18 +501,18 @@ func demuxArena(hdr streamHeader, data []byte) (Arena, error) {
 	return MultiSegment(segs), nil
 }
 
-func (msa *multiSegmentArena) NumSegments() int64 {
+func (msa *MultiSegmentArena) NumSegments() int64 {
 	return int64(len(*msa))
 }
 
-func (msa *multiSegmentArena) Data(id SegmentID) ([]byte, error) {
+func (msa *MultiSegmentArena) Data(id SegmentID) ([]byte, error) {
 	if int64(id) >= int64(len(*msa)) {
 		return nil, errorf("segment %d requested (arena only has %d segments)", id, len(*msa))
 	}
 	return (*msa)[id], nil
 }
 
-func (msa *multiSegmentArena) Allocate(sz Size, segs map[SegmentID]*Segment) (SegmentID, []byte, error) {
+func (msa *MultiSegmentArena) Allocate(sz Size, segs map[SegmentID]*Segment) (SegmentID, []byte, error) {
 	var total int64
 	for i, data := range *msa {
 		id := SegmentID(i)
@@ -519,7 +538,7 @@ func (msa *multiSegmentArena) Allocate(sz Size, segs map[SegmentID]*Segment) (Se
 	return id, buf, nil
 }
 
-func (msa *multiSegmentArena) String() string {
+func (msa *MultiSegmentArena) String() string {
 	return fmt.Sprintf("multi-segment arena [%d segments]", len(*msa))
 }
 
@@ -751,9 +770,6 @@ type Encoder struct {
 	w      io.Writer
 	hdrbuf []byte
 	bufs   [][]byte
-
-	packed  bool
-	packbuf []byte
 }
 
 // NewEncoder creates a new Cap'n Proto framer that writes to w.
@@ -764,7 +780,7 @@ func NewEncoder(w io.Writer) *Encoder {
 // NewPackedEncoder creates a new Cap'n Proto framer that writes to a
 // packed stream w.
 func NewPackedEncoder(w io.Writer) *Encoder {
-	return &Encoder{w: w, packed: true}
+	return NewEncoder(&packed.Writer{Writer: w})
 }
 
 // Encode writes a message to the encoder stream.
@@ -797,25 +813,11 @@ func (e *Encoder) Encode(m *Message) error {
 		e.hdrbuf = appendUint32(e.hdrbuf, 0)
 	}
 	e.bufs[0] = e.hdrbuf
-	if e.packed {
-		if err := e.writePacked(e.bufs); err != nil {
-			return errorf("encode: %v", err)
-		}
-		return nil
-	}
+
 	if err := e.write(e.bufs); err != nil {
 		return errorf("encode: %v", err)
 	}
-	return nil
-}
 
-func (e *Encoder) writePacked(bufs [][]byte) error {
-	for _, b := range bufs {
-		e.packbuf = packed.Pack(e.packbuf[:0], b)
-		if _, err := e.w.Write(e.packbuf); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 

@@ -1,5 +1,5 @@
-//go:build linux
-// +build linux
+//go:build linux || freebsd
+// +build linux freebsd
 
 package netavark
 
@@ -7,16 +7,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/containers/common/libnetwork/internal/util"
 	"github.com/containers/common/libnetwork/types"
-	"github.com/pkg/errors"
+	pkgutil "github.com/containers/common/pkg/util"
 	"github.com/sirupsen/logrus"
 )
 
 type netavarkOptions struct {
 	types.NetworkOptions
 	Networks map[string]*types.Network `json:"network_info"`
+}
+
+func (n *netavarkNetwork) execUpdate(networkName string, networkDNSServers []string) error {
+	retErr := n.execNetavark([]string{"update", networkName, "--network-dns-servers", strings.Join(networkDNSServers, ",")}, false, nil, nil)
+	return retErr
 }
 
 // Setup will setup the container network namespace. It returns
@@ -40,9 +46,9 @@ func (n *netavarkNetwork) Setup(namespacePath string, options types.SetupOptions
 		return nil, err
 	}
 
-	netavarkOpts, err := n.convertNetOpts(options.NetworkOptions)
+	netavarkOpts, needPlugin, err := n.convertNetOpts(options.NetworkOptions)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to convert net opts")
+		return nil, fmt.Errorf("failed to convert net opts: %w", err)
 	}
 
 	// Warn users if one or more networks have dns enabled
@@ -66,7 +72,7 @@ func (n *netavarkNetwork) Setup(namespacePath string, options types.SetupOptions
 	}
 
 	result := map[string]types.StatusBlock{}
-	err = n.execNetavark([]string{"setup", namespacePath}, netavarkOpts, &result)
+	err = n.execNetavark([]string{"setup", namespacePath}, needPlugin, netavarkOpts, &result)
 	if err != nil {
 		// lets dealloc ips to prevent leaking
 		if err := n.deallocIPs(&options.NetworkOptions); err != nil {
@@ -101,12 +107,12 @@ func (n *netavarkNetwork) Teardown(namespacePath string, options types.TeardownO
 		logrus.Error(err)
 	}
 
-	netavarkOpts, err := n.convertNetOpts(options.NetworkOptions)
+	netavarkOpts, needPlugin, err := n.convertNetOpts(options.NetworkOptions)
 	if err != nil {
-		return errors.Wrap(err, "failed to convert net opts")
+		return fmt.Errorf("failed to convert net opts: %w", err)
 	}
 
-	retErr := n.execNetavark([]string{"teardown", namespacePath}, netavarkOpts, nil)
+	retErr := n.execNetavark([]string{"teardown", namespacePath}, needPlugin, netavarkOpts, nil)
 
 	// when netavark returned an error we still free the used ips
 	// otherwise we could end up in a state where block the ips forever
@@ -122,22 +128,35 @@ func (n *netavarkNetwork) Teardown(namespacePath string, options types.TeardownO
 	return retErr
 }
 
-func (n *netavarkNetwork) getCommonNetavarkOptions() []string {
-	return []string{"--config", n.networkRunDir, "--rootless=" + strconv.FormatBool(n.networkRootless), "--aardvark-binary=" + n.aardvarkBinary}
+func (n *netavarkNetwork) getCommonNetavarkOptions(needPlugin bool) []string {
+	opts := []string{"--config", n.networkRunDir, "--rootless=" + strconv.FormatBool(n.networkRootless), "--aardvark-binary=" + n.aardvarkBinary}
+	// to allow better backwards compat we only add the new netavark option when really needed
+	if needPlugin {
+		// Note this will require a netavark with https://github.com/containers/netavark/pull/509
+		for _, dir := range n.pluginDirs {
+			opts = append(opts, "--plugin-directory", dir)
+		}
+	}
+	return opts
 }
 
-func (n *netavarkNetwork) convertNetOpts(opts types.NetworkOptions) (*netavarkOptions, error) {
+func (n *netavarkNetwork) convertNetOpts(opts types.NetworkOptions) (*netavarkOptions, bool, error) {
 	netavarkOptions := netavarkOptions{
 		NetworkOptions: opts,
 		Networks:       make(map[string]*types.Network, len(opts.Networks)),
 	}
 
+	needsPlugin := false
+
 	for network := range opts.Networks {
 		net, err := n.getNetwork(network)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		netavarkOptions.Networks[network] = net
+		if !pkgutil.StringInSlice(net.Driver, builtinDrivers) {
+			needsPlugin = true
+		}
 	}
-	return &netavarkOptions, nil
+	return &netavarkOptions, needsPlugin, nil
 }

@@ -1,5 +1,5 @@
-//go:build linux || darwin
-// +build linux darwin
+//go:build linux || darwin || freebsd
+// +build linux darwin freebsd
 
 package utils
 
@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,7 +16,6 @@ import (
 	"github.com/containers/podman/v4/pkg/rootless"
 	systemdDbus "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/godbus/dbus/v5"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -64,7 +62,7 @@ func RunUnderSystemdScope(pid int, slice string, unitName string) error {
 	return nil
 }
 
-func getCgroupProcess(procFile string) (string, error) {
+func getCgroupProcess(procFile string, allowRoot bool) (string, error) {
 	f, err := os.Open(procFile)
 	if err != nil {
 		return "", err
@@ -72,12 +70,12 @@ func getCgroupProcess(procFile string) (string, error) {
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
-	cgroup := "/"
+	cgroup := ""
 	for scanner.Scan() {
 		line := scanner.Text()
 		parts := strings.SplitN(line, ":", 3)
 		if len(parts) != 3 {
-			return "", errors.Errorf("cannot parse cgroup line %q", line)
+			return "", fmt.Errorf("cannot parse cgroup line %q", line)
 		}
 		if strings.HasPrefix(line, "0::") {
 			cgroup = line[3:]
@@ -87,20 +85,24 @@ func getCgroupProcess(procFile string) (string, error) {
 			cgroup = parts[2]
 		}
 	}
-	if cgroup == "/" {
-		return "", errors.Errorf("could not find cgroup mount in %q", procFile)
+	if len(cgroup) == 0 || (!allowRoot && cgroup == "/") {
+		return "", fmt.Errorf("could not find cgroup mount in %q", procFile)
 	}
 	return cgroup, nil
 }
 
 // GetOwnCgroup returns the cgroup for the current process.
 func GetOwnCgroup() (string, error) {
-	return getCgroupProcess("/proc/self/cgroup")
+	return getCgroupProcess("/proc/self/cgroup", true)
+}
+
+func GetOwnCgroupDisallowRoot() (string, error) {
+	return getCgroupProcess("/proc/self/cgroup", false)
 }
 
 // GetCgroupProcess returns the cgroup for the specified process process.
 func GetCgroupProcess(pid int) (string, error) {
-	return getCgroupProcess(fmt.Sprintf("/proc/%d/cgroup", pid))
+	return getCgroupProcess(fmt.Sprintf("/proc/%d/cgroup", pid), true)
 }
 
 // MoveUnderCgroupSubtree moves the PID under a cgroup subtree.
@@ -129,11 +131,11 @@ func moveUnderCgroup(cgroup, subtree string, processes []uint32) error {
 		line := scanner.Text()
 		parts := strings.SplitN(line, ":", 3)
 		if len(parts) != 3 {
-			return errors.Errorf("cannot parse cgroup line %q", line)
+			return fmt.Errorf("cannot parse cgroup line %q", line)
 		}
 
 		// root cgroup, skip it
-		if parts[2] == "/" {
+		if parts[2] == "/" && !(unifiedMode && parts[1] == "") {
 			continue
 		}
 
@@ -178,7 +180,7 @@ func moveUnderCgroup(cgroup, subtree string, processes []uint32) error {
 				}
 			}
 		} else {
-			processesData, err := ioutil.ReadFile(filepath.Join(cgroupRoot, parts[2], "cgroup.procs"))
+			processesData, err := os.ReadFile(filepath.Join(cgroupRoot, parts[2], "cgroup.procs"))
 			if err != nil {
 				return err
 			}

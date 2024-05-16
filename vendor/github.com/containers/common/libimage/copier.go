@@ -2,6 +2,8 @@ package libimage
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -14,10 +16,10 @@ import (
 	"github.com/containers/image/v5/docker/reference"
 	"github.com/containers/image/v5/pkg/compression"
 	"github.com/containers/image/v5/signature"
+	"github.com/containers/image/v5/signature/signer"
 	storageTransport "github.com/containers/image/v5/storage"
 	"github.com/containers/image/v5/types"
 	encconfig "github.com/containers/ocicrypt/config"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -98,9 +100,19 @@ type CopyOptions struct {
 	PolicyAllowStorage bool
 	// SignaturePolicyPath to overwrite the default one.
 	SignaturePolicyPath string
+	// If non-empty, asks for signatures to be added during the copy
+	// using the provided signers.
+	Signers []*signer.Signer
 	// If non-empty, asks for a signature to be added during the copy, and
 	// specifies a key ID.
 	SignBy string
+	// If non-empty, passphrase to use when signing with the key ID from SignBy.
+	SignPassphrase string
+	// If non-empty, asks for a signature to be added during the copy, using
+	// a sigstore private key file at the provided path.
+	SignBySigstorePrivateKeyFile string
+	// Passphrase to use when signing with SignBySigstorePrivateKeyFile.
+	SignSigstorePrivateKeyPassphrase []byte
 	// Remove any pre-existing signatures. SignBy will still add a new
 	// signature.
 	RemoveSignatures bool
@@ -139,7 +151,7 @@ type CopyOptions struct {
 // copier is an internal helper to conveniently copy images.
 type copier struct {
 	imageCopyOptions copy.Options
-	retryOptions     retry.RetryOptions
+	retryOptions     retry.Options
 	systemContext    *types.SystemContext
 	policyContext    *signature.PolicyContext
 
@@ -155,39 +167,37 @@ var storageAllowedPolicyScopes = signature.PolicyTransportScopes{
 	},
 }
 
-// getDockerAuthConfig extracts a docker auth config from the CopyOptions.  Returns
-// nil if no credentials are set.
-func (options *CopyOptions) getDockerAuthConfig() (*types.DockerAuthConfig, error) {
-	authConf := &types.DockerAuthConfig{IdentityToken: options.IdentityToken}
+// getDockerAuthConfig extracts a docker auth config. Returns nil if
+// no credentials are set.
+func getDockerAuthConfig(name, passwd, creds, idToken string) (*types.DockerAuthConfig, error) {
+	numCredsSources := 0
 
-	if options.Username != "" {
-		if options.Credentials != "" {
-			return nil, errors.New("username/password cannot be used with credentials")
-		}
-		authConf.Username = options.Username
-		authConf.Password = options.Password
-		return authConf, nil
+	if name != "" {
+		numCredsSources++
+	}
+	if creds != "" {
+		name, passwd, _ = strings.Cut(creds, ":")
+		numCredsSources++
+	}
+	if idToken != "" {
+		numCredsSources++
+	}
+	authConf := &types.DockerAuthConfig{
+		Username:      name,
+		Password:      passwd,
+		IdentityToken: idToken,
 	}
 
-	if options.Credentials != "" {
-		split := strings.SplitN(options.Credentials, ":", 2)
-		switch len(split) {
-		case 1:
-			authConf.Username = split[0]
-		default:
-			authConf.Username = split[0]
-			authConf.Password = split[1]
-		}
+	switch numCredsSources {
+	case 0:
+		// Return nil if there is no credential source.
+		return nil, nil
+	case 1:
 		return authConf, nil
+	default:
+		// Cannot use the multiple credential sources.
+		return nil, errors.New("cannot use the multiple credential sources")
 	}
-
-	// We should return nil unless a token was set.  That's especially
-	// useful for Podman's remote API.
-	if options.IdentityToken != "" {
-		return authConf, nil
-	}
-
-	return nil, nil
 }
 
 // newCopier creates a copier.  Note that fields in options *may* overwrite the
@@ -225,7 +235,7 @@ func (r *Runtime) newCopier(options *CopyOptions) (*copier, error) {
 		c.systemContext.SignaturePolicyPath = options.SignaturePolicyPath
 	}
 
-	dockerAuthConfig, err := options.getDockerAuthConfig()
+	dockerAuthConfig, err := getDockerAuthConfig(options.Username, options.Password, options.Credentials, options.IdentityToken)
 	if err != nil {
 		return nil, err
 	}
@@ -291,7 +301,11 @@ func (r *Runtime) newCopier(options *CopyOptions) (*copier, error) {
 	c.imageCopyOptions.OciEncryptLayers = options.OciEncryptLayers
 	c.imageCopyOptions.OciDecryptConfig = options.OciDecryptConfig
 	c.imageCopyOptions.RemoveSignatures = options.RemoveSignatures
+	c.imageCopyOptions.Signers = options.Signers
 	c.imageCopyOptions.SignBy = options.SignBy
+	c.imageCopyOptions.SignPassphrase = options.SignPassphrase
+	c.imageCopyOptions.SignBySigstorePrivateKeyFile = options.SignBySigstorePrivateKeyFile
+	c.imageCopyOptions.SignSigstorePrivateKeyPassphrase = options.SignSigstorePrivateKeyPassphrase
 	c.imageCopyOptions.ReportWriter = options.Writer
 
 	defaultContainerConfig, err := config.Default()
@@ -343,12 +357,12 @@ func (c *copier) copy(ctx context.Context, source, destination types.ImageRefere
 	// Sanity checks for Buildah.
 	if sourceInsecure != nil && *sourceInsecure {
 		if c.systemContext.DockerInsecureSkipTLSVerify == types.OptionalBoolFalse {
-			return nil, errors.Errorf("can't require tls verification on an insecured registry")
+			return nil, fmt.Errorf("can't require tls verification on an insecured registry")
 		}
 	}
 	if destinationInsecure != nil && *destinationInsecure {
 		if c.systemContext.DockerInsecureSkipTLSVerify == types.OptionalBoolFalse {
-			return nil, errors.Errorf("can't require tls verification on an insecured registry")
+			return nil, fmt.Errorf("can't require tls verification on an insecured registry")
 		}
 	}
 
@@ -370,7 +384,7 @@ func (c *copier) copy(ctx context.Context, source, destination types.ImageRefere
 		}
 		return err
 	}
-	return returnManifest, retry.RetryIfNecessary(ctx, f, &c.retryOptions)
+	return returnManifest, retry.IfNecessary(ctx, f, &c.retryOptions)
 }
 
 // checkRegistrySourcesAllows checks the $BUILD_REGISTRY_SOURCES environment
@@ -402,7 +416,7 @@ func checkRegistrySourcesAllows(dest types.ImageReference) (insecure *bool, err 
 		AllowedRegistries  []string `json:"allowedRegistries,omitempty"`
 	}
 	if err := json.Unmarshal([]byte(registrySources), &sources); err != nil {
-		return nil, errors.Wrapf(err, "error parsing $BUILD_REGISTRY_SOURCES (%q) as JSON", registrySources)
+		return nil, fmt.Errorf("parsing $BUILD_REGISTRY_SOURCES (%q) as JSON: %w", registrySources, err)
 	}
 	blocked := false
 	if len(sources.BlockedRegistries) > 0 {
@@ -413,7 +427,7 @@ func checkRegistrySourcesAllows(dest types.ImageReference) (insecure *bool, err 
 		}
 	}
 	if blocked {
-		return nil, errors.Errorf("registry %q denied by policy: it is in the blocked registries list (%s)", reference.Domain(dref), registrySources)
+		return nil, fmt.Errorf("registry %q denied by policy: it is in the blocked registries list (%s)", reference.Domain(dref), registrySources)
 	}
 	allowed := true
 	if len(sources.AllowedRegistries) > 0 {
@@ -425,7 +439,7 @@ func checkRegistrySourcesAllows(dest types.ImageReference) (insecure *bool, err 
 		}
 	}
 	if !allowed {
-		return nil, errors.Errorf("registry %q denied by policy: not in allowed registries list (%s)", reference.Domain(dref), registrySources)
+		return nil, fmt.Errorf("registry %q denied by policy: not in allowed registries list (%s)", reference.Domain(dref), registrySources)
 	}
 
 	for _, inseureDomain := range sources.InsecureRegistries {

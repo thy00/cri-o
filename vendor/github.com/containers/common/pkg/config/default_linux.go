@@ -2,7 +2,6 @@ package config
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strconv"
 	"strings"
@@ -13,6 +12,10 @@ import (
 const (
 	oldMaxSize = uint64(1048576)
 )
+
+func getDefaultCgroupsMode() string {
+	return "enabled"
+}
 
 // getDefaultMachineImage returns the default machine image stream
 // On Linux/Mac, this returns the FCOS stream
@@ -33,7 +36,7 @@ func getDefaultProcessLimits() []string {
 	rlim := unix.Rlimit{Cur: oldMaxSize, Max: oldMaxSize}
 	oldrlim := rlim
 	// Attempt to set file limit and process limit to pid_max in OS
-	dat, err := ioutil.ReadFile("/proc/sys/kernel/pid_max")
+	dat, err := os.ReadFile("/proc/sys/kernel/pid_max")
 	if err == nil {
 		val := strings.TrimSuffix(string(dat), "\n")
 		max, err := strconv.ParseUint(val, 10, 64)
@@ -57,4 +60,17 @@ func getDefaultTmpDir() string {
 		return path
 	}
 	return "/var/tmp"
+}
+
+func getDefaultLockType() string {
+	return "shm"
+}
+
+func getLibpodTmpDir() string {
+	return "/run/libpod"
+}
+
+// getDefaultMachineVolumes returns default mounted volumes (possibly with env vars, which will be expanded)
+func getDefaultMachineVolumes() []string {
+	return []string{"$HOME:$HOME"}
 }

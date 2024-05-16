@@ -21,6 +21,15 @@ type Interface struct {
 	cap CapabilityID
 }
 
+// i.EncodeAsPtr is equivalent to i.ToPtr(); for implementing TypeParam.
+// The segment argument is ignored.
+func (i Interface) EncodeAsPtr(*Segment) Ptr { return i.ToPtr() }
+
+// DecodeFromPtr(p) is equivalent to p.Interface(); for implementing TypeParam.
+func (Interface) DecodeFromPtr(p Ptr) Interface { return p.Interface() }
+
+var _ TypeParam[Interface] = Interface{}
+
 // NewInterface creates a new interface pointer.
 //
 // No allocation is performed in the given segment: it is used purely
@@ -67,14 +76,14 @@ func (i Interface) value(paddr address) rawPointer {
 
 // Client returns the client stored in the message's capability table
 // or nil if the pointer is invalid.
-func (i Interface) Client() *Client {
+func (i Interface) Client() Client {
 	msg := i.Message()
 	if msg == nil {
-		return nil
+		return Client{}
 	}
 	tab := msg.CapTable
 	if int64(i.cap) >= int64(len(tab)) {
-		return nil
+		return Client{}
 	}
 	return tab[i.cap]
 }
@@ -95,7 +104,16 @@ func (id CapabilityID) GoString() string {
 // A Client is a reference to a Cap'n Proto capability.
 // The zero value is a null capability reference.
 // It is safe to use from multiple goroutines.
-type Client struct {
+type Client ClientKind
+
+// The underlying type of Client. We expose this so that
+// we can use ~ClientKind as a constraint in generics to
+// capture any capability type.
+type ClientKind = struct {
+	*client
+}
+
+type client struct {
 	creatorFunc int
 	creatorFile string
 	creatorLine int
@@ -134,9 +152,9 @@ type clientHook struct {
 //
 // Typically the RPC system will create a client for the application.
 // Most applications will not need to use this directly.
-func NewClient(hook ClientHook) *Client {
+func NewClient(hook ClientHook) Client {
 	if hook == nil {
-		return nil
+		return Client{}
 	}
 	h := &clientHook{
 		ClientHook: hook,
@@ -146,11 +164,11 @@ func NewClient(hook ClientHook) *Client {
 		metadata:   *NewMetadata(),
 	}
 	h.resolvedHook = h
-	c := &Client{h: h}
+	c := Client{client: &client{h: h}}
 	if clientLeakFunc != nil {
 		c.creatorFunc = 1
 		_, c.creatorFile, c.creatorLine, _ = runtime.Caller(1)
-		runtime.SetFinalizer(c, finalizeClient)
+		c.setFinalizer()
 	}
 	return c
 }
@@ -162,7 +180,7 @@ func NewClient(hook ClientHook) *Client {
 //
 // Typically the RPC system will create a client for the application.
 // Most applications will not need to use this directly.
-func NewPromisedClient(hook ClientHook) (*Client, *ClientPromise) {
+func NewPromisedClient(hook ClientHook) (Client, *ClientPromise) {
 	if hook == nil {
 		panic("NewPromisedClient(nil)")
 	}
@@ -173,11 +191,11 @@ func NewPromisedClient(hook ClientHook) (*Client, *ClientPromise) {
 		resolved:   make(chan struct{}),
 		metadata:   *NewMetadata(),
 	}
-	c := &Client{h: h}
+	c := Client{client: &client{h: h}}
 	if clientLeakFunc != nil {
 		c.creatorFunc = 2
 		_, c.creatorFile, c.creatorLine, _ = runtime.Caller(1)
-		runtime.SetFinalizer(c, finalizeClient)
+		c.setFinalizer()
 	}
 	return c, &ClientPromise{h: h}
 }
@@ -185,8 +203,8 @@ func NewPromisedClient(hook ClientHook) (*Client, *ClientPromise) {
 // startCall holds onto a hook to prevent it from shutting down until
 // finish is called.  It resolves the client's hook as much as possible
 // first.  The caller must not be holding onto c.mu.
-func (c *Client) startCall() (hook ClientHook, resolved, released bool, finish func()) {
-	if c == nil {
+func (c Client) startCall() (hook ClientHook, resolved, released bool, finish func()) {
+	if c.client == nil {
 		return nil, true, false, func() {}
 	}
 	defer c.mu.Unlock()
@@ -212,8 +230,8 @@ func (c *Client) startCall() (hook ClientHook, resolved, released bool, finish f
 	}
 }
 
-func (c *Client) peek() (hook *clientHook, released bool, resolved bool) {
-	if c == nil {
+func (c Client) peek() (hook *clientHook, released bool, resolved bool) {
+	if c.client == nil {
 		return nil, false, true
 	}
 	defer c.mu.Unlock()
@@ -254,7 +272,7 @@ func resolveHook(h *clientHook) *clientHook {
 
 // Get the current flowcontrol.FlowLimiter used to manage flow control
 // for this client.
-func (c *Client) GetFlowLimiter() flowcontrol.FlowLimiter {
+func (c Client) GetFlowLimiter() flowcontrol.FlowLimiter {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	ret := c.limiter
@@ -268,7 +286,10 @@ func (c *Client) GetFlowLimiter() flowcontrol.FlowLimiter {
 // this client. This affects all future calls, but not calls already
 // waiting to send. Passing nil sets the value to flowcontrol.NopLimiter,
 // which is also the default.
-func (c *Client) SetFlowLimiter(lim flowcontrol.FlowLimiter) {
+//
+// When .Release() is called on the client, it will call .Release() on
+// the FlowLimiter in turn.
+func (c Client) SetFlowLimiter(lim flowcontrol.FlowLimiter) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.limiter = lim
@@ -281,7 +302,7 @@ func (c *Client) SetFlowLimiter(lim flowcontrol.FlowLimiter) {
 //
 // This method respects the flow control policy configured with SetFlowLimiter;
 // it may block if the sender is sending too fast.
-func (c *Client) SendCall(ctx context.Context, s Send) (*Answer, ReleaseFunc) {
+func (c Client) SendCall(ctx context.Context, s Send) (*Answer, ReleaseFunc) {
 	h, _, released, finish := c.startCall()
 	defer finish()
 	if released {
@@ -292,12 +313,12 @@ func (c *Client) SendCall(ctx context.Context, s Send) (*Answer, ReleaseFunc) {
 	}
 
 	limiter := c.GetFlowLimiter()
-	var gotResponse func()
 
 	// We need to call PlaceArgs before we will know the size of message for
 	// flow control purposes, so wrap it in a function that measures after the
 	// arguments have been placed:
 	placeArgs := s.PlaceArgs
+	var size uint64
 	s.PlaceArgs = func(args Struct) error {
 		var err error
 		if placeArgs != nil {
@@ -307,30 +328,48 @@ func (c *Client) SendCall(ctx context.Context, s Send) (*Answer, ReleaseFunc) {
 			}
 		}
 
-		var size uint64
 		size, err = args.Segment().Message().TotalSize()
-		if err != nil {
-			return err
-		}
-
-		gotResponse, err = limiter.StartMessage(ctx, size)
 		return err
 	}
 
-	ans, err := h.Send(ctx, s)
-	if err == nil {
-		p := ans.f.promise
-		p.mu.Lock()
-		if p.isResolved() {
-			// Wow, that was fast.
-			p.mu.Unlock()
-			gotResponse()
-		} else {
-			p.signals = append(p.signals, gotResponse)
-			p.mu.Unlock()
-		}
+	ans, rel := h.Send(ctx, s)
+	// FIXME: an earlier version of this code called StartMessage() from
+	// within PlaceArgs -- but that can result in a deadlock, since it means
+	// the client hook is holding a lock while we're waiting on the limiter.
+	//
+	// As a temporary workaround, we instead do StartMessage *after* the send.
+	// This still has a bug, but a much less serious one: we may slightly
+	// over-use our limit, but only by the size of a single message. This is
+	// mostly a problem in that it contradicts the documentation and is
+	// conceptually odd.
+	//
+	// Longer term, we should fix a more serious design problem: Send() is
+	// holding a lock while calling into user code (PlaceArgs), so this
+	// deadlock could also arise if the user code blocks. Once that is solved,
+	// we can back out this hack.
+	gotResponse, err := limiter.StartMessage(ctx, size)
+	if err != nil {
+		// HACK: An error should only happen if the context was cancelled,
+		// in which case the caller will notice it soon probably. The call
+		// still went off ok, so we can just return the result we already
+		// got, and trying to report the error is awkward because we can't
+		// return one... so we don't. Set gotResponse to something that won't
+		// break things, and call it a day. See comments above about a
+		// longer term solution to this mess.
+		gotResponse = func() {}
 	}
-	return ans, err
+	p := ans.f.promise
+	p.mu.Lock()
+	if p.isResolved() {
+		// Wow, that was fast.
+		p.mu.Unlock()
+		gotResponse()
+	} else {
+		p.signals = append(p.signals, gotResponse)
+		p.mu.Unlock()
+	}
+
+	return ans, rel
 }
 
 // RecvCall starts executing a method with the referenced arguments
@@ -341,7 +380,7 @@ func (c *Client) SendCall(ctx context.Context, s Send) (*Answer, ReleaseFunc) {
 //
 // Note that unlike SendCall, this method does *not* respect the flow
 // control policy configured with SetFlowLimiter.
-func (c *Client) RecvCall(ctx context.Context, r Recv) PipelineCaller {
+func (c Client) RecvCall(ctx context.Context, r Recv) PipelineCaller {
 	h, _, released, finish := c.startCall()
 	defer finish()
 	if released {
@@ -358,7 +397,7 @@ func (c *Client) RecvCall(ctx context.Context, r Recv) PipelineCaller {
 // IsValid reports whether c is a valid reference to a capability.
 // A reference is invalid if it is nil, has resolved to null, or has
 // been released.
-func (c *Client) IsValid() bool {
+func (c Client) IsValid() bool {
 	h, released, _ := c.peek()
 	return !released && h != nil
 }
@@ -367,7 +406,7 @@ func (c *Client) IsValid() bool {
 // same call to NewClient.  This can return false negatives if c or c2
 // are not fully resolved: use Resolve if this is an issue.  If either
 // c or c2 are released, then IsSame panics.
-func (c *Client) IsSame(c2 *Client) bool {
+func (c Client) IsSame(c2 Client) bool {
 	h1, released, _ := c.peek()
 	if released {
 		panic("IsSame on released client")
@@ -380,7 +419,7 @@ func (c *Client) IsSame(c2 *Client) bool {
 }
 
 // Resolve blocks until the capability is fully resolved or the Context is Done.
-func (c *Client) Resolve(ctx context.Context) error {
+func (c Client) Resolve(ctx context.Context) error {
 	for {
 		h, released, resolved := c.peek()
 		if released {
@@ -401,9 +440,9 @@ func (c *Client) Resolve(ctx context.Context) error {
 
 // AddRef creates a new Client that refers to the same capability as c.
 // If c is nil or has resolved to null, then AddRef returns nil.
-func (c *Client) AddRef() *Client {
-	if c == nil {
-		return nil
+func (c Client) AddRef() Client {
+	if c.client == nil {
+		return Client{}
 	}
 	defer c.mu.Unlock()
 	c.mu.Lock()
@@ -411,27 +450,27 @@ func (c *Client) AddRef() *Client {
 		panic("AddRef on released client")
 	}
 	if c.h == nil {
-		return nil
+		return Client{}
 	}
 	c.h.mu.Lock()
 	c.h = resolveHook(c.h)
 	if c.h == nil {
-		return nil
+		return Client{}
 	}
 	c.h.refs++
 	c.h.mu.Unlock()
-	d := &Client{h: c.h}
+	d := Client{client: &client{h: c.h}}
 	if clientLeakFunc != nil {
 		d.creatorFunc = 3
 		_, d.creatorFile, d.creatorLine, _ = runtime.Caller(1)
-		runtime.SetFinalizer(d, finalizeClient)
+		d.setFinalizer()
 	}
 	return d
 }
 
 // WeakRef creates a new WeakClient that refers to the same capability
 // as c.  If c is nil or has resolved to null, then WeakRef returns nil.
-func (c *Client) WeakRef() *WeakClient {
+func (c Client) WeakRef() *WeakClient {
 	h, released, _ := c.peek()
 	if released {
 		panic("WeakRef on released client")
@@ -444,7 +483,7 @@ func (c *Client) WeakRef() *WeakClient {
 
 // State reads the current state of the client.  It returns the zero
 // ClientState if c is nil, has resolved to null, or has been released.
-func (c *Client) State() ClientState {
+func (c Client) State() ClientState {
 	h, resolved, _, finish := c.startCall()
 	defer finish()
 	if h == nil {
@@ -481,8 +520,8 @@ type ClientState struct {
 // purposes.  Its format should not be depended on: in particular, it
 // should not be used to compare clients.  Use IsSame to compare clients
 // for equality.
-func (c *Client) String() string {
-	if c == nil {
+func (c Client) String() string {
+	if c.client == nil {
 		return "<nil>"
 	}
 	c.mu.Lock()
@@ -515,10 +554,10 @@ func (c *Client) String() string {
 // reference to the capability, then the underlying resources associated
 // with the capability will be released.
 //
-// Release will panic if c has already been released, but not if c is
+// Release has no effect if c has already been released, or if c is
 // nil or resolved to null.
-func (c *Client) Release() {
-	if c == nil {
+func (c Client) Release() {
+	if c.client == nil {
 		return
 	}
 	c.mu.Lock()
@@ -548,7 +587,19 @@ func (c *Client) Release() {
 	c.mu.Unlock()
 	<-h.done
 	h.Shutdown()
+	c.GetFlowLimiter().Release()
 }
+
+func (c Client) EncodeAsPtr(seg *Segment) Ptr {
+	capId := seg.Message().AddCap(c)
+	return NewInterface(seg, capId).ToPtr()
+}
+
+func (Client) DecodeFromPtr(p Ptr) Client {
+	return p.Interface().Client()
+}
+
+var _ TypeParam[Client] = Client{}
 
 // isResolve reports whether ch has been resolved.
 // The caller must be holding onto ch.mu.
@@ -574,7 +625,11 @@ func SetClientLeakFunc(f func(msg string)) {
 	clientLeakFunc = f
 }
 
-func finalizeClient(c *Client) {
+func (c Client) setFinalizer() {
+	runtime.SetFinalizer(c.client, finalizeClient)
+}
+
+func finalizeClient(c *client) {
 	// Since there are no other references to c, then we don't have to
 	// acquire the mutex to read.
 	if c.released {
@@ -618,14 +673,29 @@ func (cp *ClientPromise) Reject(err error) {
 // NewPromisedClient will be shut down after Fulfill returns, but the
 // hook may have been shut down earlier if the client ran out of
 // references.
-func (cp *ClientPromise) Fulfill(c *Client) {
+func (cp *ClientPromise) Fulfill(c Client) {
+	cp.fulfill(c)
+	cp.shutdown()
+}
+
+// shutdown waits for all outstanding calls on the hook to complete and
+// references to be dropped, and then shuts down the hook. The caller
+// must have previously invoked cp.fulfill().
+func (cp *ClientPromise) shutdown() {
+	<-cp.h.done
+	cp.h.Shutdown()
+}
+
+// fulfill is like Fulfill, except that it does not wait for outsanding calls
+// to return answers or shut down the underlying hook.
+func (cp *ClientPromise) fulfill(c Client) {
 	// Obtain next client hook.
 	var rh *clientHook
-	if c != nil {
+	if (c != Client{}) {
 		c.mu.Lock()
 		if c.released {
 			c.mu.Unlock()
-			panic("ClientPromise.Resolve with a released client")
+			panic("ClientPromise.Fulfill with a released client")
 		}
 		// TODO(maybe): c.h = resolveHook(c.h)
 		rh = c.h
@@ -636,7 +706,7 @@ func (cp *ClientPromise) Fulfill(c *Client) {
 	cp.h.mu.Lock()
 	if cp.h.isResolved() {
 		cp.h.mu.Unlock()
-		panic("ClientPromise.Resolve called more than once")
+		panic("ClientPromise.Fulfill called more than once")
 	}
 	cp.h.resolvedHook = rh
 	close(cp.h.resolved)
@@ -656,8 +726,6 @@ func (cp *ClientPromise) Fulfill(c *Client) {
 		rh.refs += refs
 		rh.mu.Unlock()
 	}
-	<-cp.h.done
-	cp.h.Shutdown()
 }
 
 // A WeakClient is a weak reference to a capability: it refers to a
@@ -669,29 +737,29 @@ type WeakClient struct {
 
 // AddRef creates a new Client that refers to the same capability as c
 // as long as the capability hasn't already been shut down.
-func (wc *WeakClient) AddRef() (c *Client, ok bool) {
+func (wc *WeakClient) AddRef() (c Client, ok bool) {
 	if wc == nil {
-		return nil, true
+		return Client{}, true
 	}
 	if wc.h == nil {
-		return nil, true
+		return Client{}, true
 	}
 	wc.h.mu.Lock()
 	wc.h = resolveHook(wc.h)
 	if wc.h == nil {
-		return nil, true
+		return Client{}, true
 	}
 	if wc.h.refs == 0 {
 		wc.h.mu.Unlock()
-		return nil, false
+		return Client{}, false
 	}
 	wc.h.refs++
 	wc.h.mu.Unlock()
-	c = &Client{h: wc.h}
+	c = Client{client: &client{h: wc.h}}
 	if clientLeakFunc != nil {
 		c.creatorFunc = 3
 		_, c.creatorFile, c.creatorLine, _ = runtime.Caller(1)
-		runtime.SetFinalizer(c, finalizeClient)
+		c.setFinalizer()
 	}
 	return c, true
 }
@@ -761,7 +829,8 @@ type Recv struct {
 	Args Struct
 
 	// ReleaseArgs is called after Args is no longer referenced.
-	// Must not be nil.
+	// Must not be nil. If called more than once, subsequent calls
+	// must silently no-op.
 	ReleaseArgs ReleaseFunc
 
 	// Returner manages the results.
@@ -856,7 +925,7 @@ type errorClient struct {
 //
 // The returned client's State() method returns a State with its
 // Brand.Value set to e.
-func ErrorClient(e error) *Client {
+func ErrorClient(e error) Client {
 	if e == nil {
 		panic("ErrorClient(nil)")
 	}
@@ -870,7 +939,7 @@ func ErrorClient(e error) *Client {
 		metadata:   *NewMetadata(),
 	}
 	h.resolvedHook = h
-	return &Client{h: h}
+	return Client{client: &client{h: h}}
 }
 
 func (ec errorClient) Send(_ context.Context, s Send) (*Answer, ReleaseFunc) {

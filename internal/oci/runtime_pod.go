@@ -9,9 +9,10 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/containers/common/pkg/resize"
 	conmonClient "github.com/containers/conmon-rs/pkg/client"
 	conmonconfig "github.com/containers/conmon/runner/config"
-	"github.com/containers/podman/v4/libpod/define"
+	// "github.com/containers/podman/v4/libpod/define"
 	"github.com/cri-o/cri-o/pkg/config"
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
@@ -57,7 +58,7 @@ func newRuntimePod(r *Runtime, handler *config.RuntimeHandler, c *Container) (Ru
 
 	client, err := conmonClient.New(&conmonClient.ConmonServerConfig{
 		ConmonServerPath: handler.MonitorPath,
-		LogLevel:         logLevel,
+		LogLevel:         conmonClient.LogLevel(logLevel),
 		Runtime:          handler.RuntimePath,
 		ServerRunDir:     c.dir,
 		RuntimeRoot:      runRoot,
@@ -81,14 +82,18 @@ func newRuntimePod(r *Runtime, handler *config.RuntimeHandler, c *Container) (Ru
 func (r *runtimePod) CreateContainer(ctx context.Context, c *Container, cgroupParent string) error {
 	// If this container is the infra container, all that needs to be done is move conmonrs to the pod cgroup
 	if c.IsInfra() {
-		v, err := r.client.Version(ctx)
+		v, err := r.client.Version(ctx, &conmonClient.VersionConfig{Verbose: false})
 		if err != nil {
 			return fmt.Errorf("failed to get version of client before moving server to cgroup: %w", err)
 		}
 
+		if v.Tag == "" {
+			v.Tag = "none"
+		}
+
 		logrus.Debugf(
-			"Using conmonrs version: %s, tag: %s, commit: %s, build: %s, rustc: %s",
-			v.Version, v.Tag, v.Commit, v.BuildDate, v.RustVersion,
+			"Using conmonrs version: %s, tag: %s, commit: %s, build: %s, target: %s, %s, %s",
+			v.Version, v.Tag, v.Commit, v.BuildDate, v.Target, v.RustVersion, v.CargoVersion,
 		)
 
 		// Platform specific container setup
@@ -103,9 +108,10 @@ func (r *runtimePod) CreateContainer(ctx context.Context, c *Container, cgroupPa
 		ID:           c.ID(),
 		BundlePath:   c.bundlePath,
 		Terminal:     c.terminal,
+		Stdin:        c.stdin,
 		ExitPaths:    []string{filepath.Join(r.oci.config.ContainerExitsDir, c.ID()), c.exitFilePath()},
 		OOMExitPaths: []string{filepath.Join(c.bundlePath, "oom")}, // Keep in sync with location in oci.UpdateContainerStatus()
-		LogDrivers: []conmonClient.LogDriver{
+		LogDrivers: []conmonClient.ContainerLogDriver{
 			{
 				Type: conmonClient.LogDriverTypeContainerRuntimeInterface,
 				Path: c.logPath,
@@ -203,14 +209,14 @@ func (r *runtimePod) SignalContainer(ctx context.Context, c *Container, sig sysc
 	return r.oci.SignalContainer(ctx, c, sig)
 }
 
-func (r *runtimePod) AttachContainer(ctx context.Context, c *Container, inputStream io.Reader, outputStream, errorStream io.WriteCloser, tty bool, resize <-chan remotecommand.TerminalSize) error {
+func (r *runtimePod) AttachContainer(ctx context.Context, c *Container, inputStream io.Reader, outputStream, errorStream io.WriteCloser, tty bool, resizeChan <-chan remotecommand.TerminalSize) error {
 	attachSocketPath := filepath.Join(r.serverDir, c.ID(), "attach")
-	libpodResize := make(chan define.TerminalSize, 1)
+	libpodResize := make(chan resize.TerminalSize, 1)
 	go func() {
 		var event remotecommand.TerminalSize
-		var libpodEvent define.TerminalSize
+		var libpodEvent resize.TerminalSize
 
-		for event = range resize {
+		for event = range resizeChan {
 			libpodEvent.Height = event.Height
 			libpodEvent.Width = event.Width
 			libpodResize <- libpodEvent
@@ -221,10 +227,11 @@ func (r *runtimePod) AttachContainer(ctx context.Context, c *Container, inputStr
 		ID:                c.ID(),
 		SocketPath:        attachSocketPath,
 		Tty:               tty,
-		StopAfterStdinEOF: c.stdin && !c.StdinOnce() && !tty,
+		StopAfterStdinEOF: c.stdin && c.StdinOnce() && !tty,
+		ContainerStdin:    c.stdin,
 		Resize:            libpodResize,
 		Streams: conmonClient.AttachStreams{
-			Stdin:  &conmonClient.In{Reader: inputStream},
+			Stdin:  &conmonClient.In{ReadCloser: io.NopCloser(inputStream)},
 			Stdout: &conmonClient.Out{WriteCloser: outputStream},
 			Stderr: &conmonClient.Out{WriteCloser: errorStream},
 		},
