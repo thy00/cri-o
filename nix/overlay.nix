@@ -3,6 +3,9 @@ let
 in
 self: super:
 {
+  go = super.go.overrideAttrs (oldAttrs: {
+    doCheck = false;
+  });
   gpgme = (static super.gpgme);
   libassuan = (static super.libassuan);
   libgpgerror = (static super.libgpgerror);
