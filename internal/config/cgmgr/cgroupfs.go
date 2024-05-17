@@ -10,8 +10,6 @@ import (
 	"strings"
 
 	"github.com/containers/common/pkg/cgroups"
-	"github.com/cri-o/cri-o/internal/config/node"
-	"github.com/cri-o/cri-o/utils"
 	libctr "github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/cgroups/fs"
 	"github.com/opencontainers/runc/libcontainer/cgroups/fs2"
@@ -21,6 +19,9 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	types "k8s.io/cri-api/pkg/apis/runtime/v1"
+
+	"github.com/cri-o/cri-o/internal/config/node"
+	"github.com/cri-o/cri-o/utils"
 )
 
 // CgroupfsManager defines functionality whrn **** TODO: Update this
@@ -108,7 +109,7 @@ func (*CgroupfsManager) MoveConmonToCgroup(cid, cgroupParent, conmonCgroup strin
 	}
 
 	cgroupPath := fmt.Sprintf("%s/crio-conmon-%s", cgroupParent, cid)
-	control, err := cgroups.New(cgroupPath, &rspec.LinuxResources{})
+	control, err := cgroups.New(cgroupPath, &cgcfgs.Resources{})
 	if err != nil {
 		logrus.Warnf("Failed to add conmon to cgroupfs sandbox cgroup: %v", err)
 	}

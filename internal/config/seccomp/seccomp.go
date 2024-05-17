@@ -4,17 +4,19 @@ import (
 	"context"
 	"io/ioutil"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
 	"github.com/containers/common/pkg/seccomp"
-	"github.com/cri-o/cri-o/internal/log"
 	json "github.com/json-iterator/go"
 	"github.com/opencontainers/runtime-tools/generate"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	k8sV1 "k8s.io/api/core/v1"
 	types "k8s.io/cri-api/pkg/apis/runtime/v1"
+
+	"github.com/cri-o/cri-o/internal/log"
 )
 
 var (
@@ -30,7 +32,7 @@ func DefaultProfile() *seccomp.Seccomp {
 		const (
 			unshareName              = "unshare"
 			unshareParentStructIndex = 1
-			unshareIndex             = 360
+			unshareIndex             = 363
 		)
 		prof := seccomp.DefaultProfile()
 		// We know the default profile at compile time
@@ -38,7 +40,17 @@ func DefaultProfile() *seccomp.Seccomp {
 		// Panic on error and have CI catch errors on vendor bumps,
 		// to avoid combing through.
 		if prof.Syscalls[unshareParentStructIndex].Names[unshareIndex] != unshareName {
-			panic("Default seccomp profile updated and unshare syscall moved. Found unexpected syscall: " + prof.Syscalls[unshareParentStructIndex].Names[unshareIndex])
+			for i, name := range prof.Syscalls[unshareParentStructIndex].Names {
+				if name == unshareName {
+					_, file, _, _ := runtime.Caller(1)
+					logrus.Errorf("Change the `unshareIndex` variable in %s to %d", file, i)
+					break
+				}
+			}
+			logrus.Fatalf(
+				"Default seccomp profile updated and unshare syscall moved. Found unexpected syscall: %q",
+				prof.Syscalls[unshareParentStructIndex].Names[unshareIndex],
+			)
 		}
 		removeStringFromSlice(prof.Syscalls[unshareParentStructIndex].Names, unshareIndex)
 
