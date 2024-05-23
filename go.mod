@@ -68,7 +68,7 @@ require (
 )
 
 replace (
-	github.com/containers/storage v1.19.2 => github.com/thy00/storage v1.19.3
+	github.com/containers/storage v1.19.2 => github.com/thy00/storage v1.19.4
 	github.com/godbus/dbus => github.com/godbus/dbus v0.0.0-20190623212516-8a1682060722
 	github.com/prometheus/client_golang => github.com/prometheus/client_golang v0.9.2
 	github.com/sirupsen/logrus => github.com/sirupsen/logrus v1.4.2
