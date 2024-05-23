@@ -175,20 +175,20 @@ bin/crio-status: $(GO_FILES) .gopathok
 #		cp result-bin/bin/crio-* cri-o/bin"
 
 build-static2:
-       $(CONTAINER_RUNTIME) run --rm --privileged -ti -v /:/mnt \
-               nixos/nix:2.5.1 cp -rfT /nix /mnt/nix
-       $(CONTAINER_RUNTIME) run --rm --privileged -ti -v /nix:/nix -v ${PWD}:${PWD} -v /tmp:/tmp -w ${PWD} \
-               nixos/nix:2.5.1  nix --extra-experimental-features nix-command --print-build-logs --option cores 8 --option max-jobs 8 build --file nix/
-       mkdir -p bin
-       cp -r result/bin bin/static
+	$(CONTAINER_RUNTIME) run --rm --privileged -ti -v /:/mnt \
+		nixos/nix:2.5.1 cp -rfT /nix /mnt/nix
+	$(CONTAINER_RUNTIME) run --rm --privileged -ti -v /nix:/nix -v ${PWD}:${PWD} -v /tmp:/tmp -w ${PWD} \
+		nixos/nix:2.5.1  nix --extra-experimental-features nix-command --print-build-logs --option cores 8 --option max-jobs 8 build --file nix/
+	mkdir -p bin
+	cp -r result/bin bin/static
 
 build-static-arm:
-       $(CONTAINER_RUNTIME) run --rm --privileged -ti -v /:/mnt \
-               nixos/nix:2.5.1 cp -rfT /nix /mnt/nix
-       $(CONTAINER_RUNTIME) run --rm --privileged -ti -v /nix:/nix -v ${PWD}:${PWD} -v /tmp:/tmp -w ${PWD} \
-               nixos/nix:2.5.1  nix --extra-experimental-features nix-command --print-build-logs --option cores 8 --option max-jobs 8 build --file nix/default-arm64.nix
-       mkdir -p bin
-       cp -r result/bin bin/static
+	$(CONTAINER_RUNTIME) run --rm --privileged -ti -v /:/mnt \
+		nixos/nix:2.5.1 cp -rfT /nix /mnt/nix
+	$(CONTAINER_RUNTIME) run --rm --privileged -ti -v /nix:/nix -v ${PWD}:${PWD} -v /tmp:/tmp -w ${PWD} \
+		nixos/nix:2.5.1  nix --extra-experimental-features nix-command --print-build-logs --option cores 8 --option max-jobs 8 build --file nix/default-arm64.nix
+	mkdir -p bin
+	cp -r result/bin bin/static
 
 
 release-bundle: clean bin/pinns build-static docs crio.conf bundle
